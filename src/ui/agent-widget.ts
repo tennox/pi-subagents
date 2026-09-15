@@ -622,6 +622,20 @@ export class AgentWidget {
 
     this.widgetFrame++;
 
+    // The repeating timer earns its keep only while something is actually
+    // progressing (elapsed/tokens/spinner to animate) — a widget showing only
+    // lingering finished rows has nothing to tick, but was still forcing a
+    // full unmemoized re-layout at 12.5fps forever (#leak). Finished rows
+    // don't need a timer to disappear either: they age out on a turn
+    // boundary, and onTurnStart() already calls update() directly when that
+    // happens — nothing to schedule for a deadline that doesn't exist here.
+    if (hasActive) {
+      this.ensureTimer();
+    } else if (this.widgetInterval) {
+      clearInterval(this.widgetInterval);
+      this.widgetInterval = undefined;
+    }
+
     // Register widget callback once; subsequent updates use requestRender()
     // which re-invokes render() without replacing the component (avoids layout thrashing).
     if (!this.widgetRegistered) {

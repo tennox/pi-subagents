@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { renderRunningAgentStatus } from "../src/index.js";
 import type { WidgetMode } from "../src/types.js";
 import { type AgentActivity, AgentWidget, fgPreservingNestedStyles, formatCost, formatSessionTokens } from "../src/ui/agent-widget.js";
@@ -223,6 +223,125 @@ describe("AgentWidget", () => {
   it("renders nothing in 'off' mode", () => {
     const manager = { listAgents: () => [makeRecord("background", { isBackground: true })] };
     expect(renderLines(manager, "background", () => "off")).toBe("");
+  });
+});
+
+describe("AgentWidget timer leak (#leak)", () => {
+  // A running/queued agent keeps the 12.5fps timer running (stats/spinner need
+  // to tick); a finished row that lingers turn-age-gated must NOT keep that
+  // timer alive in an idle session — it has nothing left to animate, and
+  // nothing but onTurnStart() ever moves its age forward.
+  const theme = { fg: (_c: string, s: string) => s, bold: (s: string) => s };
+
+  function makeAgent(id: string, over: Record<string, unknown> = {}) {
+    return {
+      id,
+      type: "general-purpose",
+      description: `${id} description`,
+      status: "running",
+      toolUses: 0,
+      startedAt: Date.now(),
+      lifetimeUsage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      compactionCount: 0,
+      ...over,
+    };
+  }
+
+  /** Mirrors the real widget lifecycle: setWidget stores the factory, the TUI
+   * "mounts" it once (capturing `tui`/`theme` into the returned component),
+   * and later updates re-render that SAME component via requestRender(). */
+  function timerHarness(agents: unknown[]) {
+    const listAgents = vi.fn(() => agents);
+    const requestRender = vi.fn();
+    const widget = new AgentWidget({ listAgents } as any, new Map());
+    let content: any;
+    widget.setUICtx({
+      setStatus: () => {},
+      setWidget: (_key, c) => { content = c; },
+    });
+    widget.update();
+    const component = content ? content({ terminal: { columns: 120 }, requestRender }, theme) : undefined;
+    return { widget, listAgents, requestRender, component: () => component, currentContent: () => content };
+  }
+
+  it("keeps the repeating timer alive while an agent is running (existing behavior)", () => {
+    vi.useFakeTimers();
+    try {
+      const agents = [makeAgent("a1", { status: "running" })];
+      const { widget, listAgents } = timerHarness(agents);
+      // Mirrors how index.ts arms it at spawn time (widget.ensureTimer() +
+      // widget.update()) — asserted independent of whether update() also
+      // self-arms, since that isn't the behavior under test here.
+      widget.ensureTimer();
+      const before = listAgents.mock.calls.length;
+      vi.advanceTimersByTime(240); // 3 ticks at 80ms
+      expect(listAgents.mock.calls.length).toBeGreaterThan(before);
+      widget.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops the repeating timer once the only agent has finished while idle (the leak)", () => {
+    vi.useFakeTimers();
+    try {
+      const agents = [makeAgent("a1", { status: "running" })];
+      const { widget, listAgents } = timerHarness(agents);
+      widget.ensureTimer(); // as index.ts does at spawn time
+
+      // The agent finishes, but the session stays idle — no onTurnStart() call,
+      // which is exactly the scenario diagnosed: age never advances, so a fix
+      // that only cleared the interval on a turn boundary would never fire.
+      agents[0] = makeAgent("a1", { status: "completed", completedAt: Date.now() });
+      widget.markFinished("a1");
+      widget.update(); // the onAgentFinished-equivalent refresh
+
+      expect(vi.getTimerCount()).toBe(0); // no repeating interval left ticking
+      const before = listAgents.mock.calls.length;
+      vi.advanceTimersByTime(30_000); // well past any tick cadence
+      expect(listAgents.mock.calls.length).toBe(before);
+      widget.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("still renders the lingering finished row after the timer stops (nothing about the display changed)", () => {
+    vi.useFakeTimers();
+    try {
+      const agents = [makeAgent("a1", { status: "running" })];
+      const { widget, component } = timerHarness(agents);
+
+      agents[0] = makeAgent("a1", { status: "completed", completedAt: Date.now() });
+      widget.markFinished("a1");
+      widget.update();
+
+      const lines = component()!.render().join("\n");
+      expect(lines).toContain("a1 description");
+      widget.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("drops the aged-out finished agent after onTurnStart(), as before", () => {
+    vi.useFakeTimers();
+    try {
+      const agents = [makeAgent("a1", { status: "running" })];
+      const { widget, currentContent } = timerHarness(agents);
+
+      agents[0] = makeAgent("a1", { status: "completed", completedAt: Date.now() });
+      widget.markFinished("a1");
+      widget.update();
+      expect(currentContent()).toBeDefined(); // still shown, lingering
+
+      widget.onTurnStart(); // ages every finished agent by one turn (maxAge 1 → expires)
+      expect(currentContent()).toBeUndefined(); // widget cleared — nothing left to show
+
+      widget.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
