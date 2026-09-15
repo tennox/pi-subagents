@@ -361,6 +361,86 @@ describe("FleetList navigation", () => {
   });
 });
 
+describe("FleetList timer leak (#leak)", () => {
+  // A live agent keeps the 5fps timer running (stats need to tick); a finished
+  // row that lingers only because it's pinned (viewed) or paused must NOT keep
+  // that timer alive forever — it has nothing left to animate. A one-shot
+  // instead clears the row when its linger window actually expires.
+
+  function timerHarness(agents: AgentRecord[]) {
+    const listAgents = vi.fn(() => agents);
+    const manager = { listAgents, abort: () => true } as unknown as AgentManager;
+    const fleet = new FleetList(manager, new Map());
+    fleet.setUICtx({
+      setWidget: () => {}, onTerminalInput: () => () => {}, getEditorText: () => "",
+      notify: () => {}, custom: (() => new Promise<undefined>(() => {})) as FleetUICtx["custom"],
+    });
+    return { fleet, listAgents };
+  }
+
+  it("keeps the repeating timer alive while an agent is running (existing behavior)", () => {
+    vi.useFakeTimers();
+    try {
+      const agents = [makeRecord({ id: "a1", status: "running" })];
+      const { fleet, listAgents } = timerHarness(agents);
+      fleet.update();
+      const before = listAgents.mock.calls.length;
+      vi.advanceTimersByTime(1_000); // 5 ticks at 200ms
+      expect(listAgents.mock.calls.length).toBeGreaterThan(before);
+      fleet.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops the repeating timer for a finished agent pinned by viewingAgentId (the leak)", () => {
+    vi.useFakeTimers();
+    try {
+      const agents = [
+        makeRecord({
+          id: "a1",
+          status: "completed",
+          completedAt: Date.now() - 60_000, // long past FINISHED_LINGER_MS
+        }),
+      ];
+      const { fleet, listAgents } = timerHarness(agents);
+      // Pin a1 as viewed — the scenario diagnosed: viewed + finished stays in
+      // the roster indefinitely, so `roster().length > 1` never goes false.
+      (fleet as unknown as { viewingAgentId: string }).viewingAgentId = "a1";
+      fleet.update();
+      // Nothing is live and nothing is due to expire on its own (the pin isn't
+      // time-based) — no repeating interval, and no one-shot either.
+      expect(vi.getTimerCount()).toBe(0);
+      const before = listAgents.mock.calls.length;
+      vi.advanceTimersByTime(30_000); // well past the linger window
+      expect(listAgents.mock.calls.length).toBe(before); // no timer fired, no re-render
+      fleet.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("still drops a finished, non-viewed agent after FINISHED_LINGER_MS via the one-shot", () => {
+    vi.useFakeTimers();
+    try {
+      const now = Date.now();
+      const agents = [
+        makeRecord({ id: "a1", status: "completed", completedAt: now }),
+      ];
+      const { fleet, listAgents } = timerHarness(agents);
+      fleet.update();
+      expect(vi.getTimerCount()).toBe(1); // exactly the one-shot, no repeating interval
+      const before = listAgents.mock.calls.length;
+      vi.advanceTimersByTime(4_100); // past FINISHED_LINGER_MS (4000ms)
+      // The one-shot fired and re-ran update(), re-reading the roster.
+      expect(listAgents.mock.calls.length).toBeGreaterThan(before);
+      fleet.dispose();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
 describe("FleetList vs other focused components (#123)", () => {
   // pi dispatches terminal input to extension listeners BEFORE the focused
   // component (pi-tui TUI.handleInput), and ctx.ui.select/confirm/input swap

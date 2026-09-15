@@ -102,6 +102,8 @@ export class FleetList {
   private inputUnsub: (() => void) | undefined;
   private widgetRegistered = false;
   private timer: ReturnType<typeof setInterval> | undefined;
+  /** One-shot: fires `update()` once when the next lingering row is due to expire. */
+  private lingerTimer: ReturnType<typeof setTimeout> | undefined;
 
   private enabled = true;
   /** Whether arrow keys currently navigate the list (vs. flow to the editor). */
@@ -180,6 +182,7 @@ export class FleetList {
 
   dispose(): void {
     if (this.timer) { clearInterval(this.timer); this.timer = undefined; }
+    if (this.lingerTimer) { clearTimeout(this.lingerTimer); this.lingerTimer = undefined; }
     this.inputUnsub?.();
     this.inputUnsub = undefined;
     if (this.viewerClose) { this.viewerClose(); this.viewerClose = undefined; }
@@ -211,13 +214,27 @@ export class FleetList {
         this.tui = undefined;
       }
       if (this.timer) { clearInterval(this.timer); this.timer = undefined; }
+      if (this.lingerTimer) { clearTimeout(this.lingerTimer); this.lingerTimer = undefined; }
       this.active = false;
       this.selectedIndex = 0;
       return;
     }
 
     this.clampSelection();
-    this.ensureTimer(); // keep stats ticking whenever the list is shown (e.g. after a re-enable)
+
+    // The repeating timer earns its keep only while something is actually
+    // progressing (elapsed/tokens to tick) — a row full of finished/paused/
+    // viewed entries has nothing to animate but was still forcing a full
+    // unmemoized re-layout at 5fps forever (#leak). When nothing is live,
+    // fall back to a single timer that fires once the earliest linger
+    // expires, so a finished row still drops out on schedule.
+    if (this.hasLiveRows()) {
+      this.ensureTimer(); // keep stats ticking whenever live rows are shown (e.g. after a re-enable)
+      if (this.lingerTimer) { clearTimeout(this.lingerTimer); this.lingerTimer = undefined; }
+    } else {
+      if (this.timer) { clearInterval(this.timer); this.timer = undefined; }
+      this.scheduleLingerExpiry();
+    }
 
     if (!this.widgetRegistered) {
       this.ui.setWidget(FLEET_KEY, (tui, theme) => {
@@ -231,6 +248,43 @@ export class FleetList {
     } else {
       this.tui?.requestRender();
     }
+  }
+
+  /** Whether anything in the list is actually progressing (worth ticking stats for). */
+  private hasLiveRows(): boolean {
+    return this.enabled && (
+      this.agentRecords().some(a => a.status === "running" || a.status === "queued")
+      || this.workflows().some(w => w.status === "running")
+    );
+  }
+
+  /**
+   * Arm the one-shot that clears the next expired linger, unless one is
+   * already pending — `update()` may re-enter this path on every re-render
+   * while nothing is live, and re-arming each time would leak timers.
+   */
+  private scheduleLingerExpiry(): void {
+    if (this.lingerTimer) return;
+    const delay = this.nextLingerExpiryDelay();
+    if (delay == null) return; // only pinned/paused rows left — nothing will expire on its own
+    this.lingerTimer = setTimeout(() => { this.lingerTimer = undefined; this.update(); }, delay);
+  }
+
+  /**
+   * Ms until the soonest row still in the roster because it's within
+   * `FINISHED_LINGER_MS`, not because it's pinned (viewed agent, paused
+   * run) — those persist independent of time, so a pin doesn't count here.
+   */
+  private nextLingerExpiryDelay(): number | undefined {
+    const now = Date.now();
+    const expiries: number[] = [];
+    for (const a of this.agentRecords()) {
+      if (a.completedAt != null && a.id !== this.viewingAgentId) expiries.push(a.completedAt + FINISHED_LINGER_MS);
+    }
+    for (const w of this.workflows()) {
+      if (w.completedAt != null) expiries.push(w.completedAt + FINISHED_LINGER_MS);
+    }
+    return expiries.length ? Math.max(0, Math.min(...expiries) - now) : undefined;
   }
 
   // ---- Roster ----
