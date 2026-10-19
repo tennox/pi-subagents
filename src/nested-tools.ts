@@ -25,7 +25,7 @@ import {
   streamToOutputFile,
   writeInitialEntry,
 } from "./output-file.js";
-import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
+import { getForegroundOutcomeNote, getStatusNote, getSubagentStallMinutes, partialOutputSuffix } from "./status-note.js";
 import type {
   AgentConfig,
   AgentInvocation,
@@ -47,7 +47,7 @@ let maxSubagentDepth = 2;
 export function getMaxSubagentDepth(): number { return maxSubagentDepth; }
 export function setMaxSubagentDepth(n: number): void { maxSubagentDepth = Math.max(0, Math.floor(n)); }
 
-const NESTED_TOOL_NAMES = ["Agent", "get_subagent_result", "steer_subagent"] as const;
+const NESTED_TOOL_NAMES = ["Agent", "get_subagent_result", "steer_subagent", "subagents"] as const;
 
 interface NestedSpawnOptions {
   description: string;
@@ -60,6 +60,12 @@ interface NestedSpawnOptions {
   isolation?: IsolationMode;
   invocation?: AgentInvocation;
   signal?: AbortSignal;
+  /**
+   * Final-text activity marker, forwarded from `RunOptions.onModelText` — the
+   * manager stamps `lastActivityAt` on it so a text-only child can't look
+   * stalled to the `subagents` list tool.
+   */
+  onModelText?: (text: string) => void;
   onAssistantUsage?: (usage: { input: number; output: number; cacheWrite: number }) => void;
   onSessionCreated?: (session: AgentSession) => void;
   depth: number;
@@ -67,6 +73,13 @@ interface NestedSpawnOptions {
   maxSubagentDepth: number;
   configCwd?: string;
   rootSessionId?: string;
+  /** Caller's session id, so the child's `subagents` tool can resolve "me". */
+  parentSessionId?: string;
+  /**
+   * Model label for the child's `subagents` rows, resolved at spawn time the
+   * way the top-level tool's is (`provider/id`, or `inherit`).
+   */
+  modelLabel?: string;
 }
 
 export interface NestedAgentManager {
@@ -89,6 +102,8 @@ export interface NestedAgentManager {
     onSpawned?: (id: string) => void,
   ): Promise<{ id: string; record: AgentRecord }>;
   getRecord(id: string): AgentRecord | undefined;
+  /** All records (children filter happens at the call site via parentAgentId). */
+  listAgents(): AgentRecord[];
   resume(id: string, prompt: string, signal?: AbortSignal): Promise<AgentRecord | undefined>;
 }
 
@@ -96,6 +111,14 @@ export interface NestedToolContext {
   manager: NestedAgentManager;
   pi: ExtensionAPI;
   parentAgentId: string;
+  /**
+   * Id of the session running this parent agent (its record id for a nested
+   * parent, the main session's id at top level). Rows the `subagents` tool
+   * shows are keyed on records' `parentSessionId` against this value, so a
+   * parent lists only its own children and the main session sees only
+   * top-level agents.
+   */
+  parentSessionId?: string;
   depth: number;
   maxSubagentDepth: number;
   /** "all" = any enabled agent; string[] = only those types. Never empty. */
@@ -263,6 +286,12 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         inheritContext: invocation.inheritContext,
         thinkingLevel: invocation.thinking,
         isolation: invocation.isolation,
+        // The resolved model as the top-level tool records it — fallback when
+        // the child's session never reports one, and `inherit` when neither
+        // caller nor file named a model.
+        modelLabel: model
+          ? `${model.provider}/${model.id}`
+          : (invocation.modelInput ?? "inherit"),
         invocation: {
           thinking: invocation.thinking,
           maxTurns: invocation.maxTurns,
@@ -293,6 +322,14 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
         maxSubagentDepth: context.maxSubagentDepth,
         configCwd: context.configCwd,
         rootSessionId,
+        // The CALLER's session (this child), not the root's: a grandchild's
+        // rows resolve ownership against parentSessionId, which is set from
+        // this id at spawn time.
+        parentSessionId: ctx.sessionManager?.getSessionId?.(),
+        onModelText: (text) => {
+          const rec = childId === undefined ? undefined : context.manager.getRecord(childId);
+          if (rec && text) rec.lastActivityAt = Date.now();
+        },
       };
 
       // Transcript wiring, same gate as the top-level path: the child's
@@ -418,5 +455,38 @@ export function createNestedSubagentTools(context: NestedToolContext): ToolDefin
     },
   });
 
-  return [agentTool, resultTool, steerTool];
+  const subagentsTool = defineTool({
+    name: NESTED_TOOL_NAMES[3],
+    label: "List Nested Subagents",
+    description:
+      "List subagents owned by this parent — status, activity, and a stalled flag — before assuming one is still running.",
+    parameters: Type.Object({
+      include_completed: Type.Optional(Type.Boolean()),
+      stall_minutes: Type.Optional(Type.Number()),
+    }),
+    execute: async (_toolCallId, params) => {
+      const stallMinutes = params.stall_minutes ?? getSubagentStallMinutes();
+      const rows = context.manager
+        .listAgents()
+        .filter((r) => r.parentAgentId === context.parentAgentId)
+        .filter((r) =>
+          params.include_completed ? true : r.status === "running" || r.status === "queued",
+        );
+      if (rows.length === 0) {
+        return textResult(
+          "No nested subagents owned by this parent" +
+            (params.include_completed ? "." : " (pass include_completed to see finished ones)."),
+        );
+      }
+      const lines = rows.map((r) => {
+        const since = r.lastToolStartedAt ?? r.lastActivityAt ?? r.spawnedAt ?? r.startedAt;
+        const stalled =
+          r.status === "running" && since !== undefined && Date.now() - since > stallMinutes * 60_000;
+        return `${stalled ? `⚠ stalled (>${stallMinutes}m without tool activity)\n` : ""}${formatRecord(r, "inline")}`;
+      });
+      return textResult(lines.join("\n\n"));
+    },
+  });
+
+  return [agentTool, resultTool, steerTool, subagentsTool];
 }

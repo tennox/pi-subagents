@@ -35,7 +35,7 @@ import { createOutputFilePath, ensureOutputFile, getOutputTranscriptDefault, ses
 import { SubagentScheduler } from "./schedule.js";
 import { resolveStorePath, ScheduleStore } from "./schedule-store.js";
 import { applyAndEmitLoaded, loadSettings, type SubagentsSettings, saveAndEmitChanged, type ToolDescriptionMode } from "./settings.js";
-import { getForegroundOutcomeNote, getStatusNote, partialOutputSuffix } from "./status-note.js";
+import { getForegroundOutcomeNote, getStatusNote, getSubagentStallMinutes, partialOutputSuffix, setSubagentStallMinutes } from "./status-note.js";
 import { type AgentConfig, type AgentInvocation, type AgentMentionMode, type AgentRecord, type JoinMode, type NotificationDetails, type SubagentType, type ViewerMarkdownMode, type WidgetMode } from "./types.js";
 import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-mention.js";
 import {
@@ -788,6 +788,12 @@ export default function (pi: ExtensionAPI) {
   // bound session_start, so a filtered-out activation never advertises (#142).
   pi.on("session_start", async (_event, ctx) => {
     currentCtx = ctx;
+    // Scope for the `subagents` list tool: rows filter on parentSessionId ===
+    // this value, so the main session sees only top-level agents (nested rows
+    // are served by the nested variant, keyed on the parent record id).
+    // Re-set on every session_start so /new-style id changes re-scope it.
+    const listScopeSessionId = ctx.sessionManager?.getSessionId?.();
+    if (listScopeSessionId) setSubagentsListScope({ mainSessionId: listScopeSessionId });
     if (ctx.hasUI) {
       widget.setUICtx(ctx.ui);
       fleet.setUICtx(ctx.ui as any);
@@ -1421,6 +1427,7 @@ export default function (pi: ExtensionAPI) {
       setWorktreeIsolation: setWorktreeIsolationEnabled,
       setWorkflowsEnabled: setWorkflowsEnabled,
       setMaxSubagentDepth: setMaxSubagentDepth,
+      setSubagentStallMinutes,
       setFallbackSubagent: setFallbackSubagent,
       setReportUsage,
       setShowCost,
@@ -1482,7 +1489,8 @@ Notes:
 - Parallel work: one message, multiple Agent calls — they run concurrently.
 - Subagents run in the background by default; you'll be notified when one completes. Pass run_in_background: false only when your very next action depends on the result and nothing else could usefully happen while it runs. Never fabricate or predict a pending agent's results — if the user asks before the notification arrives, say it's still running.
 - The result is not shown to the user — summarize it for them. Verify an agent's claimed code changes before reporting work done.
-- resume continues a previous agent by ID; steer_subagent messages a running one.${isolationCompactGuideline}`;
+- resume continues a previous agent by ID; steer_subagent messages a running one.
+- Not sure a background agent still exists? subagents lists live agents + their status (flags stalled/dead ones).${isolationCompactGuideline}`;
 
   const fullAgentToolDescription = `Launch a new agent to handle complex, multi-step tasks autonomously. Each agent type has specific capabilities and tools available to it.
 
@@ -1508,6 +1516,7 @@ If the target is already known, use a direct tool — \`read\` for a known path,
 - **Don't race**: after launching a background agent, you know nothing about its results. Never fabricate or predict them in any format — not as prose, summary, or structured output. The completion notification arrives in a later turn; it is never something you write yourself. If the user asks before it lands, say the agent is still running — give status, not a guess.
 - Use resume with an agent ID to continue a previous agent's work. A new (non-resume) Agent call starts a fresh agent with no memory of prior runs, so the prompt must be self-contained.
 - Use steer_subagent to send mid-run messages to a running background agent.
+- If unsure whether a background agent still exists, call \`subagents\` to list live agents and their status (flags stalled/dead ones).
 - Clearly tell the agent whether you expect it to write code or just to do research (search, file reads, etc.), since it is not aware of the user's intent.
 - If an agent's description says it should be used proactively, try to use it without the user having to ask for it first.
 - Use model to specify a different model (as "provider/modelId", or fuzzy e.g. "haiku", "sonnet").
@@ -2873,6 +2882,175 @@ Terse command-style prompts produce shallow, generic work.
     },
   }));
 
+  // ---- subagents list tool ----
+
+  /**
+   * Scope key for the `subagents` rows: the main session's id, set once at
+   * `session_start`. Top-level records carry it as `parentSessionId`, so the
+   * top-level tool filters on it; nested tools scope to their own caller and
+   * don't read it (shared through module state — nested-tools cannot import
+   * index.js, the same one-way rule as `getSubagentStallMinutes`).
+   */
+  let subagentsListMainSessionId: string | undefined;
+  function setSubagentsListScope(scope: { mainSessionId: string }): void {
+    subagentsListMainSessionId = scope.mainSessionId;
+  }
+
+  /**
+   * Failure classes read off a settled record's `error` — the strings the
+   * provider and this extension actually produce, matched loosely enough to
+   * survive prefixes. Anything unrecognized reads as a plain `error`.
+   */
+  function classifyFailure(error?: string): string | undefined {
+    if (!error) return undefined;
+    const e = error.toLowerCase();
+    if (e.includes("429") || e.includes("rate limit") || e.includes("rate_limit") || e.includes("too many requests")) return "rate-limited (429)";
+    if (e.includes("content_filter") || e.includes("content filter") || e.includes("content policy")) return "content-filtered";
+    if (e.includes("agent not found")) return "agent-not-found";
+    if (e.includes("aborted") || e.includes("abort")) return "aborted";
+    if (e.includes("max turns") || e.includes("max_turns")) return "turn-limit";
+    return "error";
+  }
+
+  /**
+   * One line per agent row — shared by the tool and `/subagents` so the two
+   * surfaces cannot drift. `since` ("tool" = tool-start clock, "act" = last
+   * activity clock) only matters for running rows, where it decides `stalled`.
+   */
+  function formatAgentRow(
+    record: AgentRecord,
+    modelLabel: string | undefined,
+    now: number,
+    stallMinutes: number,
+  ): string {
+    const {
+      id, handle, alias, type, status, description, toolUses,
+      spawnedAt, startedAt, lastActivityAt, lastToolStartedAt, error,
+    } = record;
+    const created = new Date(spawnedAt ?? startedAt).toISOString();
+    const lastAct = new Date(lastActivityAt ?? startedAt).toISOString();
+    const name = alias ?? handle ?? "-";
+    const parts: string[] = [`id=${id}`, `name=${name}`, `type=${type}`];
+    if (modelLabel) parts.push(`model=${modelLabel}`);
+    parts.push(`status=${status}`);
+    if (status === "error" && error) {
+      const cls = classifyFailure(error);
+      if (cls && cls !== "error") parts.push(`failure=${cls}`);
+    }
+    parts.push(`spawned-at=${created}`);
+    parts.push(`last-activity=${lastAct}`);
+    parts.push(`tool-uses=${toolUses}`);
+    if (record.invocation?.maxTurns) parts.push(`turns=${record.invocation.maxTurns}`);
+    const tokens = formatLifetimeTokens(record);
+    if (tokens) parts.push(tokens);
+    if (status === "running") {
+      const ref = lastToolStartedAt ?? startedAt;
+      const idleMin = Math.floor((now - ref) / 60000);
+      if (now - ref > stallMinutes * 60000) parts.push(`stalled=yes (no tool start for ${idleMin}m)`);
+      else parts.push("stalled=no");
+    }
+    return `- ${parts.join(" | ")} — ${description}`;
+  }
+
+  /**
+   * The list itself — shared by the `subagents` tool and the `/subagents`
+   * command so the two surfaces cannot drift. Scope key: `mainSessionId` set at
+   * `session_start` (only top-level records carry it as `parentSessionId`);
+   * nested children are listed only through the nested tool, which scopes on
+   * its own caller. `stallMinutes` is the per-call override of the setting.
+   */
+  function subagentsListText(params: {
+    includeCompleted?: boolean;
+    agentId?: string;
+    stallMinutes?: number;
+  }): string {
+    const now = Date.now();
+    const stallMinutes = params.stallMinutes && params.stallMinutes >= 1
+      ? Math.floor(params.stallMinutes)
+      : getSubagentStallMinutes();
+
+    // Truth source: the live records, never the output files. Top-level scope
+    // = records whose parentSessionId is this main session — nested children
+    // are owned by their parent agent and listed only through the nested tool.
+    let records = manager.listAgents().filter(
+      (r) => r.parentSessionId !== undefined && r.parentSessionId === subagentsListMainSessionId,
+    );
+    if (params.agentId) {
+      const ref = resolveAgentRef(params.agentId);
+      records = ref ? records.filter((r) => r.id === ref.id) : [];
+    }
+    if (!params.includeCompleted) {
+      records = records.filter((r) => r.status === "running" || r.status === "queued");
+    }
+
+    const lines: string[] = [];
+    if (records.length === 0) {
+      lines.push(
+        params.agentId
+          ? `No subagent matches "${params.agentId}".`
+          : params.includeCompleted
+            ? "No subagents known."
+            : "No subagents currently running or queued.",
+      );
+    } else {
+      for (const record of records) {
+        lines.push(formatAgentRow(record, record.invocation?.modelId ?? record.invocation?.modelName, now, stallMinutes));
+      }
+    }
+
+    if (params.includeCompleted) {
+      const tombstones = manager.listTombstones();
+      for (const t of tombstones) {
+        lines.push(
+          `- id=${t.id} name=${t.alias ?? t.handle ?? "-"} type=${t.type} status=evicted ` +
+          `spawned-at=? completed-at=${new Date(t.completedAt).toISOString()} — resumable via @${t.handle}`,
+        );
+      }
+      const jobs = scheduler.list();
+      if (jobs.length > 0) {
+        lines.push(`scheduled jobs (${jobs.length}):`);
+        for (const job of jobs) lines.push(`  - ${JSON.stringify(job)}`);
+      }
+    }
+
+    return lines.join("\n");
+  }
+
+  // ---- subagents list tool ----
+
+  registerToolReportingUsage(defineTool({
+    name: SUBAGENT_TOOL_NAMES.LIST,
+    label: "List Subagents",
+    description:
+      "List currently known subagents and their status — running, queued, completed or failed — with ids, " +
+      "last activity and a stall flag. Use this whenever you are unsure whether a subagent is actually still " +
+      "running; agents' memories of what they spawned are unreliable, this reads the live registry.",
+    promptSnippet: "List running subagents and their status",
+    parameters: Type.Object({
+      include_completed: Type.Optional(
+        Type.Boolean({
+          description: "Also list settled (completed/error/stopped) agents and evicted tombstones. Default: false — only running/queued rows.",
+        }),
+      ),
+      agent_id: Type.Optional(
+        Type.String({
+          description: "Show only this agent (id or handle).",
+        }),
+      ),
+      stall_minutes: Type.Optional(
+        Type.Number({
+          description: "Minutes without a tool start after which a running row is flagged stalled. Overrides the configured default for this call.",
+        }),
+      ),
+    }),
+    execute: async (_toolCallId, params) =>
+      textResult(subagentsListText({
+        includeCompleted: params.include_completed,
+        agentId: params.agent_id,
+        stallMinutes: params.stall_minutes,
+      })),
+  }));
+
   // ---- /agents interactive menu ----
 
   // Directory resolution and the frontmatter edits live in agent-file-toggle.ts
@@ -3466,6 +3644,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
       // `fallbackSubagent` below.
       workflowsEnabled: isWorkflowsPinned() ? isWorkflowsEnabled() : undefined,
       maxSubagentDepth: getMaxSubagentDepth(),
+      subagentStallMinutes: getSubagentStallMinutes(),
       // Deliberately NOT `?? "general-purpose"`: every settings change writes the
       // whole snapshot, and materializing the implicit default would turn it into
       // explicit configuration — which then fails loudly if general-purpose later
@@ -3490,7 +3669,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
   void _settingsSnapshotIsComplete;
 
   const NUMERIC_IDS = new Set([
-    "maxConcurrent", "maxConcurrentForeground", "defaultMaxTurns", "graceTurns", "maxSubagentDepth",
+    "maxConcurrent", "maxConcurrentForeground", "defaultMaxTurns", "graceTurns", "maxSubagentDepth", "subagentStallMinutes",
   ]);
 
   async function showSettings(ctx: ExtensionCommandContext) {
@@ -3543,6 +3722,13 @@ Write the file using the write tool. Only write the file, nothing else.`;
           description: "Hard cap on nested delegation — main is 0, its subagents 1 (0/1 = nesting off, Enter to type)",
           currentValue: String(msd),
           values: [String(msd)],
+        },
+        {
+          id: "subagentStallMinutes",
+          label: "Stall after",
+          description: "Minutes without a tool start after which a running row of the `subagents` list is flagged stalled (1..1440, Enter to type)",
+          currentValue: String(getSubagentStallMinutes()),
+          values: [String(getSubagentStallMinutes())],
         },
         {
           id: "joinMode",
@@ -3729,6 +3915,12 @@ Write the file using the write tool. Only write the file, nothing else.`;
               : `Nested depth set to ${n}. Applies to agents started from now on.`,
           );
         }
+      } else if (id === "subagentStallMinutes") {
+        const n = parseInt(value, 10);
+        if (n >= 1) {
+          setSubagentStallMinutes(n);
+          notifyApplied(ctx, `Stall flag after ${getSubagentStallMinutes()} minutes without tool activity`);
+        }
       } else if (id === "joinMode") {
         setDefaultJoinMode(value as JoinMode);
         notifyApplied(ctx, `Default join mode set to ${value}`);
@@ -3902,7 +4094,9 @@ Write the file using the write tool. Only write the file, nothing else.`;
             ? String(getDefaultMaxTurns() ?? 0)
             : result === "maxSubagentDepth"
               ? String(getMaxSubagentDepth())
-              : String(getGraceTurns());
+              : result === "subagentStallMinutes"
+                ? String(getSubagentStallMinutes())
+                : String(getGraceTurns());
 
       const label = result === "maxConcurrent"
         ? "Max concurrency (1+)"
@@ -3912,7 +4106,9 @@ Write the file using the write tool. Only write the file, nothing else.`;
             ? "Default max turns (0 = unlimited)"
             : result === "maxSubagentDepth"
               ? "Nested depth (0/1 = nesting off)"
-              : "Grace turns (1+)";
+              : result === "subagentStallMinutes"
+                ? "Stall after (minutes, 1+)"
+                : "Grace turns (1+)";
 
       // Loop until user enters a valid integer or cancels (Esc / null).
       // Silently trims whitespace; rejects non-numeric input by re-prompting.
@@ -3968,6 +4164,20 @@ Write the file using the write tool. Only write the file, nothing else.`;
   pi.registerCommand("agents", {
     description: "Manage agents",
     handler: async (_args, ctx) => { await showAgentsMenu(ctx); },
+  });
+
+  /**
+   * `/subagents` — the human-facing twin of the `subagents` tool: the same
+   * rows, the same scope (this session's top-level agents), rendered as a
+   * notification instead of a tool result. Any of `all`/`completed`/`done`/
+   * `finished` in the args adds settled agents, tombstones and scheduled jobs.
+   */
+  pi.registerCommand("subagents", {
+    description: "List subagents and their status (add `all` for finished ones)",
+    handler: async (args, ctx) => {
+      const includeCompleted = /\b(all|completed|done|finished)\b/i.test(args ?? "");
+      ctx.ui.notify(subagentsListText({ includeCompleted }), "info");
+    },
   });
 
   /**

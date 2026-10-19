@@ -251,6 +251,7 @@ describe("AgentManager — nested runtime propagation", () => {
           parentAgentId: id,
           depth: 2,
           maxSubagentDepth: 3,
+          parentSessionId: id,
         },
       }),
     );

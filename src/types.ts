@@ -176,6 +176,35 @@ export interface AgentRecord {
   error?: string;
   toolUses: number;
   startedAt: number;
+  /**
+   * When the spawn that created this record was requested. Stamped once at
+   * record creation and never rewritten, unlike `startedAt`, which every
+   * resume and startAgent re-stamps to the CURRENT run — so this is what the
+   * `subagents` list tool shows as the agent's age, and `startedAt` is the
+   * start of its latest run.
+   */
+  spawnedAt?: number;
+  /**
+   * Last observed activity: a tool start, or the final assistant message of a
+   * run. Stamped by AgentManager's run bridges; `startedAt` is the floor when
+   * nothing has been observed yet. Feeds the `subagents` tool's stall rule — a
+   * running row with no activity for `stall_minutes` is flagged `stalled`.
+   *
+   * Deliberately NOT stamped from onTextDelta: the completion notification,
+   * preview and transcript must not change because the `subagents` tool
+   * exists. On the spawn path onTextDelta is consumed by the manager's own
+   * closure (the caller's is invoked at runAgent level, below it), so a
+   * manager-level text stamp would fire only once, at the very end — exactly
+   * what `onModelText` covers.
+   */
+  lastActivityAt?: number;
+  /**
+   * Last time a tool STARTED in this agent's session. The primary stall
+   * signal: a running agent that has started no tool for `stall_minutes` is
+   * flagged `stalled` by the `subagents` tool. Stamped on all three run paths
+   * (spawn, foreground resume, background resume).
+   */
+  lastToolStartedAt?: number;
   completedAt?: number;
   session?: AgentSession;
   abortController?: AbortController;
@@ -271,6 +300,14 @@ export interface AgentRecord {
    * directory as their ancestors' instead of the child session's own id.
    */
   rootSessionId?: string;
+  /**
+   * Id of the session that spawned this agent: the caller's own session for a
+   * nested spawn (carried on SpawnOptions), or the main session's id for a
+   * top-level spawn. Lets the `subagents` tool resolve "which record is the
+   * caller" — a nested agent listing its children matches its own session id
+   * against records' `parentSessionId`.
+   */
+  parentSessionId?: string;
 }
 
 /**

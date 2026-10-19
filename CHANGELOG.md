@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **A `subagents` list/status tool, a `/subagents` command and a `subagentStallMinutes` setting (default 10).** The tool lists the session's agents as rows (id, alias, type, model, status, last activity) with a `stalled` flag — a `running` row with no tool activity for `subagentStallMinutes` minutes — and a failure signature for ended ones. `/subagents` renders the same listing for the terminal via the shared helper, and a nested variant is scoped to the spawning parent. Session scoping keys rows on `parentSessionId` (defaulted to the calling session), so the main session sees only top-level agents.
+
 ### Fixed
 - **The workflow stand-down now recognises a lowercase `workflow` tool** ([#283](https://github.com/tintinweb/pi-subagents/issues/283) — thanks [@zampierilucas](https://github.com/zampierilucas)). The match is exact on purpose, and the set held `Workflow` and `SubagentWorkflow` only, so `@quintinshaw/pi-dynamic-workflows` — which registers lowercase `workflow` — never tripped it: with `workflowsEnabled` unset, both orchestrators reached the model and nothing warned. Adding the third name is the whole fix; exactness is kept, so a `list_workflows` still cannot take the feature down.
 

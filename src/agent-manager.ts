@@ -301,6 +301,13 @@ interface SpawnOptions {
   configCwd?: string;
   /** Root session id, inherited by nested launches so transcripts stay grouped. */
   rootSessionId?: string;
+  /**
+   * Id of the session doing the spawning — the caller's session for a nested
+   * launch, the main session's for a top-level one. Recorded on the child so
+   * the `subagents` list tool can resolve the caller (nested rows only: a
+   * child may see its own children, nothing else).
+   */
+  parentSessionId?: string;
 }
 
 interface ResumeOptions {
@@ -522,6 +529,8 @@ export class AgentManager {
       status: options.isBackground ? "queued" : "running",
       toolUses: 0,
       startedAt: Date.now(),
+      // The one stamp a resume never rewrites — `startedAt` moves on every run.
+      spawnedAt: Date.now(),
       abortController,
       lifetimeUsage: { input: 0, output: 0, cacheWrite: 0, cost: 0 },
       compactionCount: 0,
@@ -541,6 +550,12 @@ export class AgentManager {
       workflowId: options.workflowId,
       maxSubagentDepth: options.maxSubagentDepth,
       rootSessionId: options.rootSessionId,
+      // Top-level spawns pass no parentSessionId — the caller's session IS the
+      // main session, and the `subagents` list filters rows against the scope
+      // set on session_start. Nested spawns pass the parent record id explicitly
+      // (nested-runtime contract), so the ?? never fires for them; without this
+      // default the tool would silently list nothing for top-level agents.
+      parentSessionId: options.parentSessionId ?? ctx.sessionManager?.getSessionId?.(),
     };
     this.agents.set(id, record);
     // After the insert, so `takenHandles()` already counts this record's own
@@ -782,11 +797,26 @@ export class AgentManager {
       configCwd: options.configCwd ?? (customCwd !== undefined ? ctx.cwd : undefined),
       signal: record.abortController!.signal,
       onToolActivity: (activity) => {
+        if (activity.type === "start") {
+          // Primary stall signal for the `subagents` list tool. The caller's
+          // callback is untouched — instrumentation must not change the UI.
+          record.lastToolStartedAt = Date.now();
+          record.lastActivityAt = record.lastToolStartedAt;
+        }
         if (activity.type === "end") record.toolUses++;
         options.onToolActivity?.(activity);
       },
       onTurnEnd: options.onTurnEnd,
-      onTextDelta: options.onTextDelta,
+      // Consumed HERE, deliberately: the caller's onTextDelta is invoked by
+      // runAgent below this closure, so the widget stream is untouched. Text
+      // activity therefore reaches the record only once, at the end — see
+      // onModelText.
+      onTextDelta: (_delta, _full) => {
+        record.lastActivityAt = Date.now();
+      },
+      onModelText: (text) => {
+        if (text) record.lastActivityAt = Date.now();
+      },
       onAssistantUsage: (usage) => {
         addUsage(record.lifetimeUsage, usage);
         this.onUsage?.(record, usage);
@@ -802,6 +832,11 @@ export class AgentManager {
         parentAgentId: id,
         depth: record.depth ?? 1,
         maxSubagentDepth: record.maxSubagentDepth,
+        // The child's own id: its nested `subagents` tool matches records'
+        // parentSessionId against THIS value (every spawn stamps
+        // parentSessionId with the caller's session — a record id for a
+        // parent agent, the main session's id for a top-level spawn).
+        parentSessionId: id,
       },
       onSessionCreated: (session) => {
         record.session = session;
@@ -1176,6 +1211,10 @@ export class AgentManager {
     try {
       const { text, failure } = await resumeAgent(record.session, prompt, {
         onToolActivity: (activity) => {
+          if (activity.type === "start") {
+            record.lastToolStartedAt = Date.now();
+            record.lastActivityAt = record.lastToolStartedAt;
+          }
           if (activity.type === "end") record.toolUses++;
           options?.onToolActivity?.(activity);
         },
@@ -1197,6 +1236,7 @@ export class AgentManager {
       if (failure) record.error = failure;
       record.result = text;
       record.completedAt = Date.now();
+      if (text) record.lastActivityAt = record.completedAt;
     } catch (err) {
       record.status = "error";
       record.error = err instanceof Error ? err.message : String(err);
@@ -1267,6 +1307,10 @@ export class AgentManager {
 
     const promise = resumeAgent(record.session, prompt, {
       onToolActivity: (activity) => {
+        if (activity.type === "start") {
+          record.lastToolStartedAt = Date.now();
+          record.lastActivityAt = record.lastToolStartedAt;
+        }
         if (activity.type === "end") record.toolUses++;
         options.onToolActivity?.(activity);
       },
@@ -1292,6 +1336,7 @@ export class AgentManager {
         }
         record.result = text;
         record.completedAt ??= Date.now();
+        if (text) record.lastActivityAt = record.completedAt;
         settle();
         return text;
       })

@@ -133,6 +133,7 @@ describe("toolDescriptionMode", () => {
       'isolation: "worktree"',
       ".pi/agents/",
       "self-contained",
+      "subagents",
     ]) {
       expect(desc).toContain(contract);
     }
@@ -159,6 +160,7 @@ describe("toolDescriptionMode", () => {
       "model",
       "thinking",
       "inherit_context",
+      "subagents",
     ]) {
       expect(visible).toContain(contract);
     }

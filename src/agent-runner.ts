@@ -42,6 +42,8 @@ export const SUBAGENT_TOOL_NAMES = {
   WORKFLOW: "SubagentWorkflow",
   GET_RESULT: "get_subagent_result",
   STEER: "steer_subagent",
+  /** List live agents and their status — a subagent must not inherit it. */
+  LIST: "subagents",
 } as const;
 
 /** Names of tools registered by this extension that subagents must NOT inherit. */
@@ -456,6 +458,15 @@ export interface RunOptions {
   onToolActivity?: (activity: ToolActivity) => void;
   /** Called on streaming text deltas from the assistant response. */
   onTextDelta?: (delta: string, fullText: string) => void;
+  /**
+   * Called once with the run's final assistant text, after the prompt returns.
+   * The fallback activity marker for a text-only run: `onTextDelta` above is
+   * not forwarded on the resume paths at all, and a spawn whose final answer
+   * was recovered by the history fallback (not streamed as deltas) would
+   * otherwise leave `lastActivityAt` at its spawn time. Only the manager
+   * wires this — callers still go through `onTextDelta`.
+   */
+  onModelText?: (text: string) => void;
   onSessionCreated?: (session: AgentSession) => void;
   /** Called at the end of each agentic turn with the cumulative count. */
   onTurnEnd?: (turnCount: number) => void;
@@ -489,6 +500,13 @@ export interface RunOptions {
     parentAgentId: string;
     depth: number;
     maxSubagentDepth?: number;
+    /**
+     * Id of the session running THIS agent (its record's id), so its nested
+     * `subagents` tool can find the record that represents it — rows are keyed
+     * on `parentSessionId`, which every spawn sets to the caller's session
+     * (record id for a parent agent, session id for the main one).
+     */
+    parentSessionId?: string;
   };
 }
 
@@ -857,6 +875,7 @@ export async function runAgent(
         manager: nestedRuntime.manager,
         pi: options.pi,
         parentAgentId: nestedRuntime.parentAgentId,
+        parentSessionId: nestedRuntime.parentSessionId,
         depth: nestedRuntime.depth,
         maxSubagentDepth: effectiveMaxDepth,
         allowedSubagents: agentConfig.allowedSubagents,
@@ -1129,6 +1148,11 @@ export async function runAgent(
   }
 
   const responseText = collector.getText().trim() || getLastAssistantText(session, startLen);
+  // The manager's fallback activity marker: fires once with whatever the run
+  // actually produced (streamed deltas or history fallback), after the prompt
+  // returns and before `RunResult` resolves — so `lastActivityAt` is never
+  // left at spawn time for a text-only run.
+  if (responseText) options.onModelText?.(responseText);
   // A child asked for structured output that never gave any has failed, however
   // articulate its prose was. Reported through `failure` so it travels the same
   // path as a provider error rather than arriving as a successful empty answer.

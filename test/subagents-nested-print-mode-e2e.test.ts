@@ -29,7 +29,7 @@ import {
 
 vi.setConfig({ testTimeout: 30_000 });
 
-const NESTED_TOOLS = ["Agent", "get_subagent_result", "steer_subagent"];
+const NESTED_TOOLS = ["Agent", "get_subagent_result", "steer_subagent", "subagents"];
 
 function userPrompt(ctx: Context): string {
   for (const message of ctx.messages) {

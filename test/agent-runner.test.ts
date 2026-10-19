@@ -118,6 +118,7 @@ vi.mock("../src/nested-tools.js", () => ({
     { name: "Agent" },
     { name: "get_subagent_result" },
     { name: "steer_subagent" },
+    { name: "subagents" },
   ]),
 }));
 
@@ -1100,9 +1101,9 @@ describe("agent-runner master tool allowlist", () => {
       configCwd: "/tmp",
     }));
     expect(lastToolsPassed()).toEqual(expect.arrayContaining([
-      "Agent", "get_subagent_result", "steer_subagent",
+      "Agent", "get_subagent_result", "steer_subagent", "subagents",
     ]));
-    expect(createAgentSession.mock.calls[0][0].customTools).toHaveLength(3);
+    expect(createAgentSession.mock.calls[0][0].customTools).toHaveLength(4);
   });
 
   it("keeps opt-in nested tools active UNDER EXTENSIONS despite the EXCLUDED-name collision", async () => {
@@ -1126,10 +1127,10 @@ describe("agent-runner master tool allowlist", () => {
     const opts = createAgentSession.mock.calls[0][0];
     // (a) not denied at the registry gate, and passed as customTools.
     expect(opts.excludeTools ?? []).not.toContain("Agent");
-    expect(opts.customTools).toHaveLength(3);
+    expect(opts.customTools).toHaveLength(4);
     // (b) survive the active-set renarrow alongside a real extension tool.
     const active = lastToolsPassed();
-    expect(active).toEqual(expect.arrayContaining(["Agent", "get_subagent_result", "steer_subagent"]));
+    expect(active).toEqual(expect.arrayContaining(["Agent", "get_subagent_result", "steer_subagent", "subagents"]));
     expect(active).toContain("ok_ext");
   });
 

@@ -39,6 +39,13 @@ export interface SubagentsSettings {
    */
   defaultMaxTurns?: number;
   graceTurns?: number;
+  /**
+   * Minutes without tool activity after which a `running` row of the
+   * `subagents` list tool is flagged `stalled` (integer 1..1440). Defaults to
+   * `10` (status-note.ts). Read live by the tool; `stall_minutes` on a call
+   * overrides it for that call.
+   */
+  subagentStallMinutes?: number;
   defaultJoinMode?: JoinMode;
   /**
    * Whether a top-level `Agent` spawn that doesn't say runs detached.
@@ -312,6 +319,7 @@ export interface SettingsAppliers {
   setMaxConcurrentForeground: (n: number) => void;
   setDefaultMaxTurns: (n: number) => void;
   setGraceTurns: (n: number) => void;
+  setSubagentStallMinutes: (n: number) => void;
   setDefaultJoinMode: (mode: JoinMode) => void;
   setBackgroundByDefault: (b: boolean) => void;
   setSchedulingEnabled: (b: boolean) => void;
@@ -350,6 +358,7 @@ const MAX_CONCURRENT_CEILING = 1024;
 const MAX_TURNS_CEILING = 10_000;
 const GRACE_TURNS_CEILING = 1_000;
 const SUBAGENT_DEPTH_CEILING = 16;
+const STALL_MINUTES_CEILING = 1_440; // 24h — a whole day without activity is already a tombstone, not a stall
 
 /** Drop fields that don't match the expected shape. Silent — garbage becomes absent. */
 function sanitize(raw: unknown): SubagentsSettings {
@@ -392,6 +401,13 @@ function sanitize(raw: unknown): SubagentsSettings {
     (r.maxSubagentDepth as number) <= SUBAGENT_DEPTH_CEILING
   ) {
     out.maxSubagentDepth = r.maxSubagentDepth as number;
+  }
+  if (
+    Number.isInteger(r.subagentStallMinutes) &&
+    (r.subagentStallMinutes as number) >= 1 &&
+    (r.subagentStallMinutes as number) <= STALL_MINUTES_CEILING
+  ) {
+    out.subagentStallMinutes = r.subagentStallMinutes as number;
   }
   if (typeof r.defaultJoinMode === "string" && VALID_JOIN_MODES.has(r.defaultJoinMode)) {
     out.defaultJoinMode = r.defaultJoinMode as JoinMode;
@@ -517,6 +533,7 @@ export function applySettings(s: SubagentsSettings, appliers: SettingsAppliers):
   }
   if (typeof s.defaultMaxTurns === "number") appliers.setDefaultMaxTurns(s.defaultMaxTurns);
   if (typeof s.graceTurns === "number") appliers.setGraceTurns(s.graceTurns);
+  if (typeof s.subagentStallMinutes === "number") appliers.setSubagentStallMinutes(s.subagentStallMinutes);
   if (typeof s.maxSubagentDepth === "number") appliers.setMaxSubagentDepth(s.maxSubagentDepth);
   if (typeof s.fallbackSubagent === "string") appliers.setFallbackSubagent(s.fallbackSubagent);
   if (s.defaultJoinMode) appliers.setDefaultJoinMode(s.defaultJoinMode);

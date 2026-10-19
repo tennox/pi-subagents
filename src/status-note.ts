@@ -19,6 +19,21 @@ import type { AgentRecord } from "./types.js";
  * turn limit was hit) — the parent should treat human intervention differently
  * from a budget cutoff.
  */
+/**
+ * Minutes without tool activity after which a `running` row of the `subagents`
+ * list tool is flagged `stalled`. Module state (the output-file.ts pattern)
+ * because both spawn paths' settings appliers write it, and the tool reads it
+ * live — `stall_minutes` on the call overrides it per call. 10: long enough
+ * that a genuinely working agent (a long `bash`, a big `read`) never trips it,
+ * short enough that a wedged one is caught inside one turn of noticing.
+ */
+let subagentStallMinutes = 10;
+
+export function getSubagentStallMinutes(): number { return subagentStallMinutes; }
+export function setSubagentStallMinutes(n: number): void {
+  subagentStallMinutes = Math.max(1, Math.floor(n));
+}
+
 export function getStatusNote(status: string): string {
   switch (status) {
     case "stopped":
