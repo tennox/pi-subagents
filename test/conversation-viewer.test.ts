@@ -163,7 +163,7 @@ describe("ConversationViewer cost display", () => {
     // so this reads the record, and would show nothing if it did not.
     const out = header(true, 0.0042);
     expect(out).toContain("1.2k token");
-    expect(out).toContain("~$0.0042");
+    expect(out).toContain("$0.0042");
   });
 
   it("shows no cost when disabled", () => {
@@ -172,8 +172,11 @@ describe("ConversationViewer cost display", () => {
     expect(out).not.toContain("$");
   });
 
-  it("shows no cost for a model with no pricing data", () => {
-    expect(header(true, 0)).not.toContain("$");
+  it("shows the no-cost marker for a model with no pricing data", () => {
+    // Silence would read as the header forgetting a field; `$—` states that no
+    // cost figure exists, without claiming the run was measured and free.
+    expect(header(true, 0)).toContain("$—");
+    expect(header(true, 0)).not.toContain("$0");
   });
 });
 

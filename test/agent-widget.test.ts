@@ -356,35 +356,38 @@ describe("formatCost", () => {
   it("keeps the precision that distinguishes one run from another", () => {
     // Rounding to cents would print the same figure for a run that cost four
     // times another — the band most single subagent runs fall in.
-    expect(formatCost(0.0042)).toBe("~$0.0042");
-    expect(formatCost(0.0123)).toBe("~$0.0123");
-    expect(formatCost(1.239)).toBe("~$1.24");
+    expect(formatCost(0.0042)).toBe("$0.0042");
+    expect(formatCost(0.0123)).toBe("$0.0123");
+    expect(formatCost(1.239)).toBe("$1.24");
   });
 
   it("never pads a round figure with noise, nor cuts it below cents", () => {
-    expect(formatCost(0.05)).toBe("~$0.05");    // not ~$0.0500
-    expect(formatCost(0.4)).toBe("~$0.40");     // not ~$0.4
-    expect(formatCost(12)).toBe("~$12.00");
+    expect(formatCost(0.05)).toBe("$0.05");    // not $0.0500
+    expect(formatCost(0.4)).toBe("$0.40");     // not $0.4
+    expect(formatCost(12)).toBe("$12.00");
   });
 
-  it("shows nothing when there is nothing to show", () => {
-    // Zero is what a model with no pricing data reports, so `$0.00` would claim
-    // a measurement that was never made.
-    expect(formatCost(0)).toBe("");
-    expect(formatCost(Number.NaN)).toBe("");
-    expect(formatCost(-1)).toBe("");
+  it("presents the figure as what pi recorded, not an estimate", () => {
+    // The number is summed from pi's per-call cost records — the provider's
+    // own accounting of each call — so the old tilde disclaimer is gone.
+    expect(formatCost(0.5)).toBe("$0.50");
+    expect(formatCost(0.5)).not.toContain("~");
+  });
+
+  it("renders the no-cost marker, never $0.00", () => {
+    // pi zero-fills the per-call cost object, so a run whose total is 0 has no
+    // measured figure at all — "$—" must say that, not claim a measurement of
+    // 0, and not vanish (which would read as the display forgetting a field).
+    expect(formatCost(0)).toBe("$—");
+    expect(formatCost(Number.NaN)).toBe("$—");
+    expect(formatCost(-1)).toBe("$—");
   });
 
   it("says a real but tiny cost is tiny, not zero", () => {
     // The distinction the whole helper turns on: "measured, below what four
     // decimals can show" must not render the same as "never measured".
     expect(formatCost(0.00002)).toBe("<$0.0001");
-    expect(formatCost(0)).toBe("");
-  });
-
-  it("marks the figure as an estimate", () => {
-    // The tilde is the whole disclaimer — it sits beside exact token counts.
-    expect(formatCost(0.5).startsWith("~")).toBe(true);
+    expect(formatCost(0)).toBe("$—");
   });
 });
 
@@ -427,7 +430,7 @@ describe("AgentWidget cost display", () => {
   it("shows the cost beside the token count when enabled", () => {
     const line = render(true, 0.0042);
     expect(line).toContain("1.2k token");
-    expect(line).toContain("~$0.0042");
+    expect(line).toContain("$0.0042");
   });
 
   it("shows no cost when disabled", () => {
@@ -436,10 +439,12 @@ describe("AgentWidget cost display", () => {
     expect(line).not.toContain("$");
   });
 
-  it("shows no cost for an unpriced model, even when enabled", () => {
+  it("shows the no-cost marker for an unpriced model, even when enabled", () => {
+    // Silence would read as the setting having forgotten a field; $0.00 as a
+    // measurement. The marker is the honest third option.
     const line = render(true, 0);
     expect(line).toContain("1.2k token");
-    expect(line).not.toContain("$");
+    expect(line).toContain("$—");
   });
 
   it("keeps the cost visible after the agent finishes", () => {
@@ -461,7 +466,7 @@ describe("AgentWidget cost display", () => {
     const out = factory({ terminal: { columns: 200 }, requestRender: () => {} }, theme).render().join("\n");
 
     expect(out).toContain("done agent");
-    expect(out).toContain("~$0.0042");
+    expect(out).toContain("$0.0042");
   });
 
   it("shows stats for an agent nobody is tracking live", () => {
@@ -482,7 +487,7 @@ describe("AgentWidget cost display", () => {
     const out = factory({ terminal: { columns: 200 }, requestRender: () => {} }, theme).render().join("\n");
 
     expect(out).toContain("1.2k token");
-    expect(out).toContain("~$0.0042");
+    expect(out).toContain("$0.0042");
   });
 
   it("defaults to hiding it", () => {

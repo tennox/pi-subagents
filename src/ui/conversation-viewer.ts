@@ -174,9 +174,9 @@ export class ConversationViewer implements Component {
     /** Send a steering message to the agent. Omitted → no compose affordance. */
     private onSteer?: (message: string) => void,
     /**
-     * Whether the header shows an estimated cost after the token count. Read
-     * once, at construction: the overlay is opened from a menu, so the setting
-     * cannot change while it is on screen.
+     * Whether the header shows the tracked per-call cost after the token
+     * count. Read once, at construction: the overlay is opened from a menu, so
+     * the setting cannot change while it is on screen.
      */
     private showCost = false,
     /**

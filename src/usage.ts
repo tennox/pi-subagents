@@ -14,10 +14,13 @@
  * pi counts the same way (`addUsageToTotals`). Reporting 0 there would make a
  * subagent's rows count differently from every other row in one total.
  *
- * `cost` is a plain sum for the same reason: it is what pi charged for that one
- * message (`usage.cost.total`, priced from the model's rates), not a cumulative
- * figure. Both are optional because a model with no pricing data reports no
- * cost, and because every accumulator predates them; absent reads as 0.
+ * `cost` is a plain sum for the same reason: it is the per-call figure pi
+ * recorded on that one message (`usage.cost.total` — what the provider charged
+ * where it reports a cost, otherwise the returned tokens priced at the model's
+ * listed rates), not a cumulative figure. Both are optional because a call may
+ * carry no cost at all, and because every accumulator predates them; absent
+ * reads as 0. A summed 0 is rendered downstream as the no-cost marker `$—`,
+ * never as $0.00 — see `formatCost` in `agent-widget.ts`.
  */
 export type LifetimeUsage = { input: number; output: number; cacheWrite: number; cacheRead?: number; cost?: number };
 
@@ -31,7 +34,7 @@ export function getLifetimeTotal(u?: LifetimeUsage): number {
   return u ? u.input + u.output + u.cacheWrite : 0;
 }
 
-/** Accumulated cost in USD, or 0 when unpriced/undefined. */
+/** Summed per-call cost in USD, or 0 when the run's calls carried no cost. */
 export function getLifetimeCost(u?: LifetimeUsage): number {
   return u?.cost ?? 0;
 }

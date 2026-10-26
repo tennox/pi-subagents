@@ -668,12 +668,12 @@ describe("FleetList cost display", () => {
   it("appends the cost after the token count when enabled", () => {
     const out = row(true, 0.0042);
     expect(out).toContain("13.1k tokens");
-    expect(out).toContain("~$0.0042");
+    expect(out).toContain("$0.0042");
   });
 
-  it("shows no cost when disabled, and none for an unpriced model", () => {
+  it("shows no cost when disabled, and the no-cost marker for an unpriced model", () => {
     expect(row(false, 0.0042)).not.toContain("$");
-    expect(row(true, 0)).not.toContain("$");
+    expect(row(true, 0)).toContain("$—");
   });
 
   it("reads the record, so the figures do not change when the agent finishes", () => {

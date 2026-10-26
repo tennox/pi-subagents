@@ -272,13 +272,14 @@ export interface SubagentsSettings {
    */
   reportUsage?: boolean;
   /**
-   * Whether the subagent surfaces show an estimated dollar cost next to their
+   * Whether the subagent surfaces show the tracked dollar cost next to their
    * token counts (widget, FleetView, conversation viewer, foreground results,
    * completion notifications). Defaults to `false`. Applied live.
    *
-   * Rendered as `~$0.0042` — the tilde marks it as pi's reported estimate
-   * rather than a billed figure, and it is omitted entirely when the model has
-   * no pricing data, so a local model shows tokens and no dollars.
+   * Rendered as `$0.0042` — summed from pi's per-call cost figures for the
+   * agent's requests, never re-priced at display time — with an explicit
+   * no-cost marker (`$—`) when every call carried no cost, so a model pi has
+   * no pricing for shows tokens and an honest nothing rather than $0.00.
    *
    * Independent of `reportUsage`: this one is what a human reads, that one is
    * what the parent session counts.

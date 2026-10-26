@@ -475,10 +475,13 @@ export interface RunOptions {
    * Lets callers maintain a lifetime accumulator that survives compaction
    * (which replaces session.state.messages and resets stats-derived sums).
    *
-   * `cost` is pi's own `usage.cost.total` for that message — priced from the
-   * model's rates, so it is 0 (not missing) for a model pi has no pricing for.
-   * We never price anything ourselves; every dollar figure this extension shows
-   * or reports traces back to this field.
+   * `cost` is pi's own per-call figure for that message, `usage.cost.total` —
+   * what the provider charged for the call where it reports a cost, otherwise
+   * the returned tokens priced at the model's listed rates. pi zero-fills the
+   * cost object when it has no pricing, so a call with no cost reads as 0,
+   * not as a missing field. We never price anything ourselves; every dollar
+   * figure this extension shows or reports traces back to this field, and a
+   * total of 0 renders downstream as the honest no-cost marker `$—`.
    */
   onAssistantUsage?: (usage: LifetimeUsage) => void;
   /**

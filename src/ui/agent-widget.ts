@@ -83,7 +83,7 @@ export interface AgentDetails {
   turnCount?: number;
   /** Effective max turns (undefined = unlimited). */
   maxTurns?: number;
-  /** Estimated cost in USD; 0 when the model has no pricing data. */
+  /** Summed per-call cost in USD; 0 when the run's calls carried no cost, rendered `$—`. */
   cost?: number;
   agentId?: string;
   error?: string;
@@ -106,28 +106,37 @@ export function formatTokens(count: number): string {
 }
 
 /**
- * Format a cost as `~$0.0042`, or "" when there is nothing to show.
+ * Format a tracked cost as `$0.0042`.
  *
- * The tilde is load-bearing: this is pi's own estimate from the model's listed
- * rates, not a billed figure, and the surfaces that print it sit next to token
- * counts that ARE exact.
+ * The number summed is pi's per-call cost (`usage.cost.total`) across the
+ * agent's assistant messages — what the provider's exchanges cost, where pi
+ * itself records the figure. Nothing is re-priced at display time, so there is
+ * no estimate mark: for a provider that reports a billed cost the figure is
+ * what was charged; for one that doesn't, it is the provider's own listed
+ * rates applied to exactly the tokens the call returned.
  *
- * Nothing is printed for zero, which is also what a model with no pricing data
- * reports: `$0.00` beside a local model's tokens would claim its cost was
- * measured and found to be nothing, rather than never measured at all. For the
- * same reason a real cost too small for four decimals reads `<$0.0001` — it was
- * measured, and rounding it to `~$0.0000` would say the opposite.
+ * Zero renders as `$—`, the honest no-cost figure. pi zero-fills the per-call
+ * cost object when it has no pricing, so a call whose provider reported and
+ * priced nothing cannot be told apart from one never priced at all (pi gained
+ * `usage.cost.totalFromProvider` to separate these only after v1.4.0) — all a
+ * session can truthfully say is that no cost figure exists. `$0.00` would
+ * claim the run was measured and found free; silence would read as a display
+ * that forgot the field. The `$` keeps `$—` recognizable as the same slot the
+ * figures above it fill.
+ *
+ * A real cost too small for four decimals reads `<$0.0001` — it was measured,
+ * and rounding it to `$0.0001` or `$—` would say the opposite.
  */
 export function formatCost(cost: number): string {
-  if (!(cost > 0)) return "";                     // also catches NaN
+  if (!(cost > 0)) return "$—";                   // also catches NaN
   if (cost < 0.0001) return "<$0.0001";
-  if (cost >= 1) return `~$${cost.toFixed(2)}`;
+  if (cost >= 1) return `$${cost.toFixed(2)}`;
   // Under a dollar: cents at minimum, four decimals at most, nothing trailing.
   // Most single runs land between a tenth of a cent and a dime, where rounding
   // to cents would collapse a 4x difference in spend into the same figure.
   const rounded = Number(cost.toFixed(4));
   const decimals = (String(rounded).split(".")[1] ?? "").length;
-  return `~$${rounded.toFixed(Math.max(2, decimals))}`;
+  return `$${rounded.toFixed(Math.max(2, decimals))}`;
 }
 
 /**
@@ -277,9 +286,9 @@ export class AgentWidget {
      */
     private mode: () => WidgetMode = () => "all",
     /**
-     * Read live at render time, like `mode`. Whether running agents show an
-     * estimated cost beside their token count. Defaults to off — the extension
-     * supplies the user's `showCost` setting.
+     * Read live at render time, like `mode`. Whether running agents show the
+     * tracked per-call cost beside their token count. Defaults to off — the
+     * extension supplies the user's `showCost` setting.
      */
     private showCost: () => boolean = () => false,
     /**

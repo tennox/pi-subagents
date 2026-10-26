@@ -129,9 +129,9 @@ export class FleetList {
     private manager: AgentManager,
     private agentActivity: Map<string, AgentActivity>,
     /**
-     * Read live at render time. Whether each row shows an estimated cost after
-     * its token count. Defaults to off — the extension supplies the user's
-     * `showCost` setting.
+     * Read live at render time. Whether each row shows the tracked per-call
+     * cost after its token count. Defaults to off — the extension supplies the
+     * user's `showCost` setting.
      */
     private showCost: () => boolean = () => false,
     /**

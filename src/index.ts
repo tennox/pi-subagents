@@ -176,9 +176,11 @@ function formatTaskNotification(record: AgentRecord, resultMaxLen: number, showC
   const ctxXml = contextPercent !== null ? `<context_percent>${Math.round(contextPercent)}</context_percent>` : "";
   const compactXml = record.compactionCount ? `<compactions>${record.compactionCount}</compactions>` : "";
   // Only under `showCost`: this is LLM context, and a figure the orchestrator
-  // did not ask for is a figure it may start reporting unprompted.
-  const cost = showCost ? getLifetimeCost(record.lifetimeUsage) : 0;
-  const costXml = cost > 0 ? `<estimated_cost_usd>${cost.toFixed(4)}</estimated_cost_usd>` : "";
+  // did not ask for is a figure it may start reporting unprompted. `none` —
+  // never 0, which would claim the calls were priced and found free; and
+  // never omitted, which would leave the orchestrator to guess.
+  const cost = getLifetimeCost(record.lifetimeUsage);
+  const costXml = showCost ? `<cost_usd>${cost > 0 ? cost.toFixed(4) : "none"}</cost_usd>` : "";
 
   const resultPreview = record.result
     ? record.result.length > resultMaxLen
@@ -3815,7 +3817,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
           id: "showCost",
           label: "Show cost",
           description:
-            "Show an estimated `~$0.0042` beside subagent token counts in the widget, fleet view, results and notifications. Priced by pi from the model's rates — omitted entirely for a model it has no rates for.",
+            "Show a `$0.0042` beside subagent token counts in the widget, fleet view, results and notifications. The figure is pi's summed per-call cost for the agent's requests; a run whose calls carried no cost shows `$—` rather than $0.00.",
           currentValue: isShowCostEnabled() ? "on" : "off",
           values: ["on", "off"],
         },

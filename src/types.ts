@@ -351,9 +351,10 @@ export interface NotificationDetails {
   maxTurns?: number;
   totalTokens: number;
   /**
-   * Estimated cost in USD, from pi's per-message `usage.cost.total`. Always
-   * populated (0 when the model has no pricing); the renderer decides whether
-   * to show it, per the `showCost` setting.
+   * Summed per-call cost in USD, from pi's per-message `usage.cost.total`.
+   * Always populated (0 when the run's calls carried no cost); the renderer
+   * decides whether to show it, per the `showCost` setting, and renders the
+   * zero as the no-cost marker `$—` rather than `$0.00`.
    */
   totalCost?: number;
   durationMs: number;

@@ -2,10 +2,13 @@
  * cost-display.test.ts — what `showCost` puts on each surface, and what it must
  * never put there.
  *
- * Two rules run through all of it. A cost is shown only when there is one to
- * show: a model pi has no rates for reports 0, and printing `$0.00` beside its
- * tokens would claim the run was measured and free. And each surface punctuates
- * its own — the stats line joins with `·`, the foreground result with `,`, the
+ * Two rules run through all of it. A tracked figure is printed as what pi
+ * recorded per call, summed — never re-priced or re-labelled at display time;
+ * a run whose calls carried no cost anywhere renders the explicit no-cost
+ * marker `$—`, because a fabricated `$0.00` would claim the run was measured
+ * and found free, and pi zero-fills per-call cost objects so "never priced"
+ * cannot be told apart from "priced at zero". And each surface punctuates its
+ * own — the stats line joins with `·`, the foreground result with `,`, the
  * `get_subagent_result` header with `|` — which is why the cost travels as a
  * number and is formatted at the end, not baked into the token string.
  */
@@ -23,10 +26,23 @@ import { ctx, flush, type Hermetic, hermeticDir, makePi, textOf } from "./helper
 
 const COST = 0.0123;
 
-/** One foreground run that spends `cost` on a single assistant message. */
-function runSpending(cost: number) {
+/**
+ * One foreground run fired through `costs` as its per-call usage deltas — one
+ * `message_end` per entry, exactly what the runner emits for a multi-call run.
+ * `undefined` models a delta that carries no cost field at all (pi only added
+ * the cost object in later versions); mixed sessions (some calls priced, some
+ * not) are the interesting case: the sum keeps the real ones.
+ */
+function runSpending(costs: (number | undefined)[]) {
   vi.mocked(runAgent).mockImplementation(async (_c: any, _t: any, _p: any, opts: any) => {
-    opts.onAssistantUsage?.({ input: 1000, output: 200, cacheWrite: 0, cost });
+    for (const cost of costs) {
+      opts.onAssistantUsage?.({
+        input: cost === costs[0] ? 1000 : 100,
+        output: cost === costs[0] ? 200 : 20,
+        cacheWrite: 0,
+        cost,
+      });
+    }
     return { responseText: "done", session: { dispose: vi.fn() } as any, aborted: false, steered: false };
   });
 }
@@ -58,40 +74,88 @@ describe("cost display", () => {
     hermetic?.restore();
   });
 
-  describe("the foreground result the orchestrator reads", () => {
-    it("names the cost in the stats it already reports", async () => {
+  describe("the summation behind every figure", () => {
+    it("sums the per-call costs across the run's messages", async () => {
       const { tools } = boot({ showCost: true });
-      runSpending(COST);
+      runSpending([0.01, 0.02]);
 
       const text = textOf(await spawn(tools));
 
-      expect(text).toContain("~$0.0123");
+      expect(text).toContain("$0.03");
+    });
+
+    it("sums only the calls that carried a cost", async () => {
+      // Pi zero-fills `usage.cost` for a provider without pricing, so a mixed
+      // session carries real figures and zeros interleaved; the zeros must not
+      // erase the real ones or drag the sum below what the priced calls spent.
+      const { tools } = boot({ showCost: true });
+      runSpending([0.01, 0, 0.02, 0]);
+
+      const text = textOf(await spawn(tools));
+
+      expect(text).toContain("$0.03");
+    });
+
+    it("renders the no-cost marker when no call carried one", async () => {
+      // pi's own shape: every delta present, every cost zero-filled.
+      const { tools } = boot({ showCost: true });
+      runSpending([0, 0]);
+
+      const text = textOf(await spawn(tools));
+
+      expect(text).toContain("$—");
+      expect(text).not.toContain("$0");
+    });
+
+    it("renders the marker even when deltas omit the cost field entirely", async () => {
+      // The absent case, distinct from zero in shape but not in meaning: a
+      // session whose accumulator never saw a cost must read the same way,
+      // never as $0.00 and never as silence.
+      const { tools } = boot({ showCost: true });
+      runSpending([undefined, undefined]);
+
+      const text = textOf(await spawn(tools));
+
+      expect(text).toContain("$—");
+      expect(text).toContain("2.4k token"); // tokens still accrue while cost stays untracked
+    });
+  });
+
+  describe("the foreground result the orchestrator reads", () => {
+    it("names the cost in the stats it already reports", async () => {
+      const { tools } = boot({ showCost: true });
+      runSpending([COST]);
+
+      const text = textOf(await spawn(tools));
+
+      expect(text).toContain("$0.0123");
       // Comma-joined with the rest, not glued to the token count with the "·"
       // that the widget uses — the separator belongs to the surface.
-      expect(text).toMatch(/1\.2k token, ~\$0\.0123/);
+      expect(text).toMatch(/1\.2k token, \$0\.0123/);
     });
 
     it("says nothing when the setting is off", async () => {
       const { tools } = boot({ showCost: false });
-      runSpending(COST);
+      runSpending([COST]);
 
       expect(textOf(await spawn(tools))).not.toContain("$");
     });
 
-    it("says nothing for a model with no pricing data", async () => {
+    it("shows $— for a run whose calls carried none", async () => {
       const { tools } = boot({ showCost: true });
-      runSpending(0);
+      runSpending([0]);
 
       const text = textOf(await spawn(tools));
       expect(text).toContain("1.2k token");   // tokens are still exact
-      expect(text).not.toContain("$");
+      expect(text).toContain("$—");
+      expect(text).not.toContain("$0");
     });
   });
 
   describe("get_subagent_result", () => {
     it("reports the cost as its own labelled field", async () => {
       const { tools } = boot({ showCost: true });
-      runSpending(COST);
+      runSpending([COST]);
       await spawn(tools);
       await flush();
 
@@ -102,12 +166,12 @@ describe("cost display", () => {
       ));
 
       // Pipe-separated `Label: value` fields, matching its neighbours.
-      expect(text).toContain("Cost: ~$0.0123");
+      expect(text).toContain("Cost: $0.0123");
     });
 
-    it("omits the field entirely when unpriced", async () => {
+    it("labels the no-cost marker as the field's value", async () => {
       const { tools } = boot({ showCost: true });
-      runSpending(0);
+      runSpending([0]);
       await spawn(tools);
       await flush();
 
@@ -115,7 +179,8 @@ describe("cost display", () => {
         "tc-2", { agent_id: "general-purpose" }, undefined, undefined, ctx(),
       ));
 
-      expect(text).not.toContain("Cost:");
+      expect(text).toContain("Cost: $—");
+      expect(text).not.toContain("Cost: $0");
     });
   });
 
@@ -141,11 +206,11 @@ describe("cost display", () => {
 
     it("includes the cost in the usage block when enabled", async () => {
       const { pi, tools } = boot({ showCost: true, defaultJoinMode: "async" });
-      runSpending(COST);
+      runSpending([COST]);
 
       await spawnBackground(tools);
 
-      expect(await notificationText(pi)).toContain("<estimated_cost_usd>0.0123</estimated_cost_usd>");
+      expect(await notificationText(pi)).toContain("<cost_usd>0.0123</cost_usd>");
     });
 
     it("omits it when disabled — this is LLM context, not a display", async () => {
@@ -153,22 +218,23 @@ describe("cost display", () => {
       // reporting unprompted, so the setting gates the context too, not just
       // what a human sees.
       const { pi, tools } = boot({ showCost: false, defaultJoinMode: "async" });
-      runSpending(COST);
+      runSpending([COST]);
 
       await spawnBackground(tools);
 
       const text = await notificationText(pi);
       expect(text).toContain("<total_tokens>");
-      expect(text).not.toContain("estimated_cost_usd");
+      expect(text).not.toContain("cost_usd");
     });
 
-    it("omits it for a model with no pricing data", async () => {
+    it("says none — not 0 — for a run whose calls carried no cost", async () => {
       const { pi, tools } = boot({ showCost: true, defaultJoinMode: "async" });
-      runSpending(0);
+      runSpending([0]);
 
       await spawnBackground(tools);
 
-      expect(await notificationText(pi)).not.toContain("estimated_cost_usd");
+      expect(await notificationText(pi)).toContain("<cost_usd>none</cost_usd>");
+      expect(await notificationText(pi)).not.toContain("<cost_usd>0");
     });
   });
 
@@ -189,22 +255,26 @@ describe("cost display", () => {
       const { pi } = boot({ showCost: true });
       const out = render(pi, { ...agent("first", 1000, 0.01), others: [agent("second", 3000, 0.02)] });
 
-      expect(out).toContain("2 agents · 4.0k token · ~$0.03");
+      expect(out).toContain("2 agents · 4.0k token · $0.03");
     });
 
     it("does not total a single agent — the line above already says it", () => {
       const { pi } = boot({ showCost: true });
       const out = render(pi, agent("only", 1000, 0.01));
 
-      expect(out).toContain("~$0.01");
+      expect(out).toContain("$0.01");
       expect(out).not.toContain("1 agents");
     });
 
-    it("shows no total, and no per-agent cost, when unpriced", () => {
+    it("renders the group total as the no-cost marker when every agent was unpriced", () => {
+      // The total line still appears: it states the batch carried no cost
+      // figures, the same sentence the rows below it make one by one.
       const { pi } = boot({ showCost: true });
       const out = render(pi, { ...agent("first", 1000, 0), others: [agent("second", 3000, 0)] });
 
-      expect(out).not.toContain("$");
+      expect(out).toContain("2 agents · 4.0k token · $—");
+      expect(out).toContain("$—");
+      expect(out).not.toContain("$0");
     });
 
     it("shows nothing when the setting is off", () => {
