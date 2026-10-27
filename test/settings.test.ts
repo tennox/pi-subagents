@@ -144,11 +144,13 @@ describe("settings persistence", () => {
     expect(loadSettings(projectDir)).toEqual({}); // non-boolean dropped
   });
 
-  it("round-trips widgetMode; keeps valid values, drops invalid", () => {
+  it("round-trips widgetMode; keeps valid values, normalizes the retired one, drops invalid", () => {
     saveSettings({ widgetMode: "off" }, projectDir);
     expect(loadSettings(projectDir)).toEqual({ widgetMode: "off" });
-    saveSettings({ widgetMode: "background" }, projectDir);
-    expect(loadSettings(projectDir)).toEqual({ widgetMode: "background" });
+    // `background` — the retired two-widget era spelling (a foreground filter
+    // the merged block does not have) — loads as `all`.
+    writeProject({ widgetMode: "background" } as any);
+    expect(loadSettings(projectDir)).toEqual({ widgetMode: "all" });
     writeProject({ widgetMode: "sideways" } as any);
     expect(loadSettings(projectDir)).toEqual({}); // invalid value dropped
   });

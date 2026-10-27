@@ -14,7 +14,7 @@ For the channel list, the reply envelope, the per-channel snippets and the event
 
 | Field | Type | Notes |
 |---|---|---|
-| `description` | string | What the agent is doing. Shown in the widget, FleetView and the completion notification |
+| `description` | string | What the agent is doing. Shown in the agent block and the completion notification |
 | `name` | string | A memorable second handle (`@auth-audit`). Slugged, never validated — anything unusable degrades rather than failing the spawn |
 | `model` | `Model` **or** `"provider/modelId"` | Strings are resolved at the RPC boundary against `ctx.modelRegistry`. `null` means inherit, not override. Resolution is fuzzy — see [Model Scope](../README.md#model-scope) |
 | `maxTurns` | number | Turn ceiling for the run |

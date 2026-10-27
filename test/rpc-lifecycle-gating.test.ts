@@ -156,7 +156,7 @@ describe("issue #142: RPC handlers + subagents:ready are gated on session_start"
     expect(reply![1].data.id).toBeTruthy();
   });
 
-  it("renders an RPC-spawned agent in the native widget while it is running", async () => {
+  it("renders an RPC-spawned agent in the agent block while it is running", async () => {
     const { pi, lifecycle, busHandlers } = makePi();
     const activeCtx = ctx(true);
     subagentsExtension(pi);
@@ -174,7 +174,7 @@ describe("issue #142: RPC handlers + subagents:ready are gated on session_start"
 
       await vi.waitFor(() => {
         expect(activeCtx.ui.setWidget).toHaveBeenCalledWith(
-          "agents",
+          "fleet",
           expect.any(Function),
           { placement: "aboveEditor" },
         );
@@ -189,7 +189,7 @@ describe("issue #142: RPC handlers + subagents:ready are gated on session_start"
     const { pi, lifecycle, busHandlers } = makePi();
     let widgetFactory: any;
     const setWidget = vi.fn((key: string, content: any) => {
-      if (key === "agents" && content) widgetFactory = content;
+      if (key === "fleet" && content) widgetFactory = content;
     });
     const extensionCtx = ctx(true, setWidget);
     let onToolActivity: ((activity: { type: "start" | "end"; toolName: string }) => void) | undefined;
@@ -214,10 +214,16 @@ describe("issue #142: RPC handlers + subagents:ready are gated on session_start"
     onToolActivity!({ type: "start", toolName: "bash" });
 
     expect(widgetFactory).toBeTypeOf("function");
-    const lines = widgetFactory(
-      { terminal: { columns: 120 }, requestRender: vi.fn() },
-      { fg: (_color: string, text: string) => text, bold: (text: string) => text },
-    ).render().join("\n");
+    // Prime the block with its tui (pi invokes the factory on first render) —
+    // the activity line is the FOCUSED state's second row, so move focus into
+    // the list with ↓, exactly as a user would at an empty prompt.
+    const tui = { terminal: { columns: 120 }, requestRender: vi.fn() };
+    const theme = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
+    const block = widgetFactory(tui, theme);
+    const press = extensionCtx.ui.onTerminalInput.mock.calls.at(-1)![0] as (data: string) => unknown;
+    press("\x1b[B"); // ↓
+
+    const lines = block.render(120).join("\n");
     expect(lines).toContain("running command…");
     expect(lines).not.toContain("thinking…");
   });

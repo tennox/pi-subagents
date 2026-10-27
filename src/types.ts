@@ -93,13 +93,18 @@ export interface AgentConfig {
 export type JoinMode = 'async' | 'group' | 'smart';
 
 /**
- * Display mode for the persistent above-editor agent widget.
- * - `all`: show every agent (foreground + background).
- * - `background`: hide foreground agents (they already render inline as the
- *   Agent tool result, #118); show background/queued/scheduled/RPC.
- * - `off`: hide the widget entirely.
+ * Display mode for the persistent agent block (one list above the editor, see
+ * `fleet-list.ts`):
+ * - `all` (default): the block shows — every top-level agent, whatever ran in
+ *   the foreground or the background.
+ * - `off`: hide the block entirely.
+ *
+ * The old `background` middle value had no surviving meaning: it filtered
+ * foreground agents out of the retired separate widget, but the merged block is
+ * the fleet's roster, which never had that filter. Settings written before the
+ * merge load `background` as `all` (see `settings.ts`).
  */
-export type WidgetMode = 'all' | 'background' | 'off';
+export type WidgetMode = 'all' | 'off';
 
 /**
  * How much of the conversation viewer's transcript is rendered as Markdown.

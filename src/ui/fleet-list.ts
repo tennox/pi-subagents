@@ -1,41 +1,73 @@
 /**
- * fleet-list.ts — Claude Code-style "FleetView" list rendered below the editor.
+ * fleet-list.ts — the ONE persistent agent list, rendered above the editor.
  *
- * Shows `main` + each running/queued subagent as a navigable list. Pressing ↓ (or
- * ←) at an empty prompt activates the list; ↑/↓ move the selection (filled ● marker),
- * Enter opens the selected agent's live conversation overlay, Esc returns to the prompt.
- * A viewer stays open when its agent finishes; finished agents linger briefly in the list.
+ * Merges what used to be two simultaneous listings of the same subagents: the
+ * above-editor `AgentWidget` (spinner rows, tree lines, turn-aged finished
+ * lines) and the below-editor FleetView (navigable rows with selection, an
+ * overlay viewer and workflow runs). Every agent is rendered exactly once, in
+ * one block:
  *
- * Mechanics (see plan): the list is a `belowEditor` widget (render-only), and ALL key
- * handling goes through `onTerminalInput` — which fires before the focused editor and
- * can `consume` keys — gated on `getEditorText() === ""` so normal typing is untouched.
+ *   - Idle (unfocused), the block is compact: one informative line per agent
+ *     (type, description, mode tag, turns, tool uses, tokens with context%,
+ *     agent rows above `MAX_AGENT_ROWS` collapse into a single `+N more`, and
+ *     recently finished agents linger as settled rows for `FINISHED_LINGER_MS`.
+ *   - Focused (the user pressed ↓/← at an empty prompt), every agent shows with
+ *     no cap and no windowing, running agents gain a second `⎿ …` activity
+ *     line, and ↑/↓/Enter/Esc navigate — Enter opens the selected agent's live
+ *     conversation overlay, Esc returns to the prompt.
+ *
+ * `main` is the first row: activating the list lands on it, and Enter on it
+ * returns to the prompt. Workflow runs render above the agents, each as one row.
+ *
+ * Mechanics (see plan): the block is an `aboveEditor` widget (render-only), and
+ * ALL key handling goes through `onTerminalInput` — which fires before the
+ * focused editor and can `consume` keys — gated on `getEditorText() === ""` so
+ * normal typing is untouched.
  */
 
 import { Editor, isKeyRelease, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { hasAgentBadge, renderAgentName } from "../agent-color.js";
 import { type AgentManager, isTopLevelAgent } from "../agent-manager.js";
 import type { AgentRecord, ViewerMarkdownMode } from "../types.js";
-import { getLifetimeCost, getLifetimeTotal } from "../usage.js";
-import { type AgentActivity, formatCost, type Theme } from "./agent-widget.js";
+import { getLifetimeCost, getLifetimeTotal, getSessionContextPercent } from "../usage.js";
+import {
+  type AgentActivity,
+  buildInvocationTags,
+  describeActivity,
+  ERROR_STATUSES,
+  fgPreservingNestedStyles,
+  formatCost,
+  formatSessionTokens,
+  formatTurns,
+  getPromptModeLabel,
+  SPINNER,
+  type Theme,
+} from "./agent-widget.js";
 import { ConversationViewer, VIEWPORT_HEIGHT_PCT } from "./conversation-viewer.js";
 
-/** Widget key for the below-editor fleet list. */
+/** Widget key for the above-editor agent block. */
 const FLEET_KEY = "fleet";
-/** Max agent rows shown at once; extras collapse into a "↓ N more" indicator. */
+/** Agent rows the block shows before the remainder collapses into a `+N more` line. */
 const MAX_AGENT_ROWS = 5;
 /** Re-render cadence so elapsed/token stats tick while agents run. */
 const TICK_MS = 200;
 /** How long a finished agent lingers in the list before it drops out. */
 const FINISHED_LINGER_MS = 4000;
 
-/** Minimal UI surface the FleetView needs from `ctx.ui` (structural subset). */
+/** Minimal UI surface the block needs from `ctx.ui` (structural subset). */
 export type FleetUICtx = {
+  setStatus(key: string, text: string | undefined): void;
   setWidget(
     key: string,
     content: undefined | ((tui: any, theme: Theme) => { render(width: number): string[]; invalidate(): void; dispose?(): void }),
     options?: { placement?: "aboveEditor" | "belowEditor" },
   ): void;
-  onTerminalInput(handler: (data: string) => { consume?: boolean; data?: string } | undefined): () => void;
+  /**
+   * Optional: the block also captures the UI from paths without a terminal —
+   * an Agent tool executed headless, or a UI stub that renders but never takes
+   * keys. There the block stays render-only.
+   */
+  onTerminalInput?(handler: (data: string) => { consume?: boolean; data?: string } | undefined): () => void;
   getEditorText(): string;
   notify(message: string, type?: "info" | "warning" | "error"): void;
   custom<T>(
@@ -45,7 +77,7 @@ export type FleetUICtx = {
 };
 
 /**
- * A workflow run, as the fleet list needs to see it.
+ * A workflow run, as the agent list needs to see it.
  *
  * Narrow on purpose: the list knows nothing about `WorkflowTask`, the runtime
  * or the dialog, so it stays as testable as it was when it only held agents.
@@ -96,6 +128,33 @@ function rightAlign(left: string, right: string, width: number): string {
   return truncateToWidth(leftClamped + " ".repeat(gap) + right, width);
 }
 
+/**
+ * The settled row's icon in the slot next to the bullet, carried over from the
+ * retired separate widget's finished lines: ✓ succeeded, ✓ steered to its turn
+ * limit, ■ stopped, ✗ errored or aborted.
+ */
+function settledIcon(record: AgentRecord, theme: Theme): string {
+  switch (record.status) {
+    case "completed": return theme.fg("success", "✓");
+    case "steered": return theme.fg("warning", "✓");
+    case "stopped": return theme.fg("dim", "■");
+    default: return theme.fg("error", "✗");
+  }
+}
+
+/**
+ * A settled row's trailing annotation, after its stats — the same wording and
+ * coloring the widget's finished lines had. `ERROR_STATUSES` is exactly the set
+ * of statuses that carry one; a completed run says nothing.
+ */
+function settledStatusText(record: AgentRecord, theme: Theme): string {
+  if (!ERROR_STATUSES.has(record.status)) return "";
+  if (record.status === "steered") return theme.fg("warning", " (turn limit)");
+  if (record.status === "stopped") return theme.fg("dim", " stopped");
+  const errMsg = record.error ? `: ${record.error.slice(0, 60)}` : "";
+  return theme.fg("error", ` error${errMsg}`);
+}
+
 export class FleetList {
   private ui: FleetUICtx | undefined;
   private tui: any | undefined;
@@ -105,7 +164,6 @@ export class FleetList {
   /** One-shot: fires `update()` once when the next lingering row is due to expire. */
   private lingerTimer: ReturnType<typeof setTimeout> | undefined;
 
-  private enabled = true;
   /** Whether arrow keys currently navigate the list (vs. flow to the editor). */
   private active = false;
   /** 0 = `main`, 1..N = subagents. */
@@ -124,16 +182,32 @@ export class FleetList {
    * minus the close handle, because that overlay belongs to the extension.
    */
   private viewingWorkflowId: string | undefined;
+  /** Spinner frame for running rows; advances with the stat tick. */
+  private spinnerFrame = 0;
+  /** Last status bar text, used to avoid redundant setStatus calls. */
+  private lastStatusText: string | undefined;
 
   constructor(
     private manager: AgentManager,
     private agentActivity: Map<string, AgentActivity>,
+    /**
+     * Read live at render/keyboard time. Both settings gates in one place: the
+     * list shows only while `fleetView` is on AND `widgetMode` is not `off`.
+     * Read live, not captured, so a settings toggle applies without a rebuild.
+     */
+    private visible: () => boolean = () => true,
     /**
      * Read live at render time. Whether each row shows the tracked per-call
      * cost after its token count. Defaults to off — the extension supplies the
      * user's `showCost` setting.
      */
     private showCost: () => boolean = () => false,
+    /**
+     * Read live at render time. Whether running rows name the model driving
+     * them and the thinking level it is running at, before their stats.
+     * Defaults to off — the extension supplies the user's `showModel` setting.
+     */
+    private showModel: () => boolean = () => false,
     /**
      * The user's `viewerMarkdown` setting, for a conversation overlay opened
      * from here. Read live rather than captured, because the viewer's `m` key
@@ -150,13 +224,6 @@ export class FleetList {
 
   // ---- Lifecycle ----
 
-  setEnabled(enabled: boolean): void {
-    if (enabled === this.enabled) return;
-    this.enabled = enabled;
-    if (!enabled) this.active = false;
-    this.update();
-  }
-
   /** Capture the UI context and (re)register the global input handler. */
   setUICtx(ui: FleetUICtx): void {
     if (ui === this.ui) return;
@@ -164,12 +231,19 @@ export class FleetList {
     this.ui = ui;
     this.widgetRegistered = false;
     this.tui = undefined;
-    this.inputUnsub = ui.onTerminalInput(data => this.handleKey(data));
+    this.lastStatusText = undefined;
+    // Headless UIs (pi -p, tool-execute mocks) carry no input hook; the block
+    // is render-only there and keys simply never reach it.
+    this.inputUnsub = ui.onTerminalInput?.(data => this.handleKey(data));
   }
 
   /** Ensure the re-render timer is running (called when an agent spawns). */
   ensureTimer(): void {
-    if (!this.timer) this.timer = setInterval(() => this.update(), TICK_MS);
+    if (!this.timer) {
+      // The tick animates the spinner frames; update() alone does not advance
+      // them, so a render stays byte-stable however often the callers refresh.
+      this.timer = setInterval(() => { this.spinnerFrame++; this.update(); }, TICK_MS);
+    }
   }
 
   /**
@@ -190,24 +264,54 @@ export class FleetList {
     // No handle to close the workflow inspector with, but the list is going
     // away — leaving the id set would keep it swallowing input forever.
     this.viewingWorkflowId = undefined;
-    if (this.ui && this.widgetRegistered) this.ui.setWidget(FLEET_KEY, undefined);
+    if (this.ui && this.widgetRegistered) {
+      this.ui.setWidget(FLEET_KEY, undefined);
+      this.ui.setStatus("subagents", undefined);
+    }
     this.widgetRegistered = false;
     this.tui = undefined;
     this.active = false;
+    this.lastStatusText = undefined;
     // Null last so a `viewerClose()` microtask above can't re-register the widget.
     this.ui = undefined;
   }
 
-  /** Re-register/refresh the below-editor widget; clears it when nothing remains. */
+  /** Re-register/refresh the above-editor widget; clears it when nothing remains. */
   update(): void {
     if (!this.ui) return;
+
+    // The status bar is independent of the block's two visibility settings: run
+    // agents are worth announcing in whatever surface the user has left.
+    const agents = topLevelAgents(this.manager);
+    const runningCount = agents.filter(a => a.status === "running").length;
+    const queuedCount = agents.filter(a => a.status === "queued").length;
+    let newStatusText: string | undefined;
+    const total = runningCount + queuedCount;
+    if (total > 0) {
+      const statusParts: string[] = [];
+      if (runningCount > 0) statusParts.push(`${runningCount} running`);
+      if (queuedCount > 0) statusParts.push(`${queuedCount} queued`);
+      newStatusText = `${statusParts.join(", ")} agent${total === 1 ? "" : "s"}`;
+    }
+    if (newStatusText !== this.lastStatusText) {
+      this.ui.setStatus("subagents", newStatusText);
+      this.lastStatusText = newStatusText;
+    }
+
     // A run with no agents of its own left in the list is still worth a row —
     // it is the thing the user opens to see what its children did. Read off the
     // roster for the same reason activation does: two counts of "is there
-    // anything here" drifted apart once before.
-    const hasRows = this.enabled && this.roster().length > 1;
+    // anything here" drifted apart once before. A top-level agent without a
+    // session counts as content too: it is either queued behind the pool (the
+    // summary line below is its own row) or still establishing one — an RPC,
+    // scheduler or mention spawn enters through the manager, whose onStart
+    // refresh lands BEFORE runAgent has created the session. Counting both is
+    // what makes the block appear at spawn time; the starting one's row
+    // follows on the next tick, once the session exists.
+    const starting = agents.some(a => !a.session && (a.status === "running" || a.status === "queued"));
+    const hasVisible = this.visible() && (this.roster().length > 1 || starting);
 
-    if (!hasRows) {
+    if (!hasVisible) {
       if (this.widgetRegistered) {
         this.ui.setWidget(FLEET_KEY, undefined);
         this.widgetRegistered = false;
@@ -223,11 +327,11 @@ export class FleetList {
     this.clampSelection();
 
     // The repeating timer earns its keep only while something is actually
-    // progressing (elapsed/tokens to tick) — a row full of finished/paused/
-    // viewed entries has nothing to animate but was still forcing a full
-    // unmemoized re-layout at 5fps forever (#leak). When nothing is live,
-    // fall back to a single timer that fires once the earliest linger
-    // expires, so a finished row still drops out on schedule.
+    // progressing (elapsed/tokens/spinner to tick) — a row full of finished/
+    // paused/viewed entries has nothing to animate but would still force a full
+    // unmemoized re-layout at 5fps forever (#leak). When nothing is live, fall
+    // back to a single timer that fires once the earliest linger expires, so a
+    // finished row still drops out on schedule.
     if (this.hasLiveRows()) {
       this.ensureTimer(); // keep stats ticking whenever live rows are shown (e.g. after a re-enable)
       if (this.lingerTimer) { clearTimeout(this.lingerTimer); this.lingerTimer = undefined; }
@@ -243,7 +347,7 @@ export class FleetList {
           render: (w: number) => this.renderBar(w, theme),
           invalidate: () => { this.widgetRegistered = false; this.tui = undefined; },
         };
-      }, { placement: "belowEditor" });
+      }, { placement: "aboveEditor" });
       this.widgetRegistered = true;
     } else {
       this.tui?.requestRender();
@@ -252,8 +356,12 @@ export class FleetList {
 
   /** Whether anything in the list is actually progressing (worth ticking stats for). */
   private hasLiveRows(): boolean {
-    return this.enabled && (
+    return this.visible() && (
       this.agentRecords().some(a => a.status === "running" || a.status === "queued")
+      // Still establishing its session (spawn → runAgent window): live, and
+      // this tick is what notices the session arriving — nothing else fires
+      // for a manager-entered spawn.
+      || topLevelAgents(this.manager).some(a => !a.session && a.status === "running")
       || this.workflows().some(w => w.status === "running")
     );
   }
@@ -288,6 +396,16 @@ export class FleetList {
   }
 
   // ---- Roster ----
+
+  /**
+   * Queued top-level agents with no session yet — pending starts parked behind
+   * the concurrency limit. They are not rows (there is nothing to open), they
+   * are the block's `◦ N queued` summary, the retired separate widget's count
+   * line.
+   */
+  private pendingQueued(): AgentRecord[] {
+    return topLevelAgents(this.manager).filter(a => !a.session && a.status === "queued");
+  }
 
   /**
    * Agents shown in the list, ordered earliest-launched first so the ones you
@@ -360,7 +478,7 @@ export class FleetList {
 
   /** Returns `{consume:true}` to swallow a key, or undefined to let it through. */
   handleKey(data: string): { consume?: boolean; data?: string } | undefined {
-    if (!this.enabled || !this.ui) return undefined;
+    if (!this.visible() || !this.ui) return undefined;
     // Input listeners receive BOTH key-press and key-release (the kitty protocol
     // emits both, and matchesKey matches either) — act on press only, or every
     // tap would move/fire twice. Repeats still pass through for held-key nav.
@@ -512,38 +630,60 @@ export class FleetList {
   // ---- Rendering ----
 
   private renderBar(width: number, theme: Theme): string[] {
-    const rows = this.roster().slice(1) as (WorkflowEntry | AgentEntry)[];
-    if (rows.length === 0) return [];
+    const rows = [
+      ...this.workflows().map(workflow => ({ kind: "workflow" as const, workflow })),
+      ...this.agentRecords().map(record => ({ kind: "agent" as const, record })),
+    ];
+    const pendingCount = this.pendingQueued().length;
+    if (rows.length === 0 && pendingCount === 0) return [];
     // Clamp locally so a render between a roster shrink and the next update()
     // (e.g. on terminal resize) never loses the selection marker.
     const sel = Math.min(this.selectedIndex, rows.length);
 
-    const hint = this.active
-      ? "↑↓ select · enter view · esc back"
-      : "esc to interrupt · ← for agents · ↓ to manage";
-    const lines: string[] = [];
-    lines.push(truncateToWidth("  " + theme.fg("dim", hint), width));
-    lines.push("");
-    lines.push(truncateToWidth(`  ${this.bullet(0, sel, theme)} main`, width));
+    const live = this.hasLiveRows();
+    const headingColor = live ? "accent" : "dim";
+    const headingIcon = live ? "●" : "○";
 
-    // Window the rows so the selected one stays visible.
-    const visible = Math.min(MAX_AGENT_ROWS, rows.length);
-    const selRow = Math.max(0, sel - 1);
-    const start = selRow < visible ? 0 : selRow - visible + 1;
-    const hiddenBelow = rows.length - (start + visible);
+    const lines: string[] = [
+      truncateToWidth(theme.fg(headingColor, headingIcon) + " " + theme.fg(headingColor, "Agents"), width),
+      truncateToWidth("  " + theme.fg("dim", this.hint()), width),
+      "",
+      truncateToWidth(`  ${this.bullet(0, sel, theme)} main`, width),
+    ];
 
-    if (start > 0) lines.push(rightAlign("", theme.fg("dim", `↑ ${start} more`), width));
-    for (let a = start; a < start + visible; a++) {
-      const row = rows[a];
+    // Focused, every row shows — the selection is always on screen, so the old
+    // fleet's windowing indicators have nothing to do. Idle, the block is
+    // capped and the remainder collapses into one `+N more` line: agents come
+    // after the workflow rows, so agent rows are the ones that collapse.
+    const maxRows = this.active ? rows.length : Math.min(MAX_AGENT_ROWS, rows.length);
+    const hidden = rows.length - maxRows;
+    for (let i = 0; i < maxRows; i++) {
+      const row = rows[i];
       lines.push(
         row.kind === "workflow" ?
-          this.renderWorkflowRow(a + 1, sel, row.workflow, width, theme)
-        : this.renderAgentRow(a + 1, sel, row.record, width, theme),
+          this.renderWorkflowRow(i + 1, sel, row.workflow, width, theme)
+        : this.renderAgentRow(i + 1, sel, row.record, width, theme),
       );
+      // A focused running agent's second line — what it is doing right now,
+      // under its stats, exactly as the retired separate widget showed it.
+      if (this.active && row.kind === "agent" && row.record.status === "running") {
+        const activity = this.agentActivity.get(row.record.id);
+        lines.push(truncateToWidth(theme.fg("dim", `  ⎿  ${describeActivity(activity?.activeTools ?? new Map(), activity?.responseText)}`), width));
+      }
     }
-    if (hiddenBelow > 0) lines.push(rightAlign("", theme.fg("dim", `↓ ${hiddenBelow} more`), width));
+
+    if (pendingCount > 0) {
+      lines.push(truncateToWidth(`  ${theme.fg("muted", "◦")} ${theme.fg("dim", `${pendingCount} queued`)}`, width));
+    }
+    if (hidden > 0) {
+      lines.push(rightAlign("", theme.fg("dim", `+${hidden} more`), width));
+    }
 
     return lines;
+  }
+
+  private hint(): string {
+    return this.active ? "↑↓ select · enter view · esc back" : "esc to interrupt · ← for agents · ↓ to manage";
   }
 
   private bullet(rosterIndex: number, sel: number, theme: Theme): string {
@@ -574,24 +714,59 @@ export class FleetList {
   }
 
   private renderAgentRow(rosterIndex: number, sel: number, record: AgentRecord, width: number, theme: Theme): string {
+    const selected = rosterIndex === sel;
     // The selected row renders in the theme's primary text color so it reads as
     // one selection (#230). A configured badge survives — Claude Code's FleetView
     // keeps the agent color on the selected row too and only bolds it — which also
     // keeps the row's width fixed as the selection moves.
-    const selected = rosterIndex === sel;
     const name = renderAgentName(record.type, theme, selected
       ? { fallbackColor: "text", bold: hasAgentBadge(record.type) }
       : { fallbackColor: "muted" });
+    const modeTag = getPromptModeLabel(record.type);
     const description = selected ? theme.fg("text", record.description) : record.description;
-    const left = `  ${this.bullet(rosterIndex, sel, theme)} ${name}  ${description}`;
-    // The record, not the activity tracker — see the note in AgentWidget's
-    // running line: only the record carries a nested child's spend, and only it
-    // outlives the agent.
+    // The slot after the bullet carries the live state: the animated spinner
+    // frame while running (kept from the retired separate widget, animated by
+    // the stat tick), the settled icon once the agent is done.
+    const glyph = record.status === "running"
+      ? ` ${theme.fg("accent", SPINNER[this.spinnerFrame % SPINNER.length])}`
+      : record.status === "queued" ? ""
+      : ` ${settledIcon(record, theme)}`;
+    const left = `  ${this.bullet(rosterIndex, sel, theme)}${glyph} ${name}${modeTag ? ` ${theme.fg("dim", `(${modeTag})`)}` : ""}  ${description}`;
+
+    // Spend and tokens read from the record, never from the activity tracker:
+    // the record is the one that survives the agent finishing, and the one
+    // nested-tools folds a hidden child's spend into. Reading the tracker while
+    // an agent runs and the record once it stops made the figure jump at
+    // completion. The tracker still lends the live turn count.
+    const activity = this.agentActivity.get(record.id);
     const tokens = getLifetimeTotal(record.lifetimeUsage);
+    const tokenText = tokens > 0 ? formatSessionTokens(tokens, getSessionContextPercent(record.session), theme, record.compactionCount) : "";
+    const costText = this.showCost() ? formatCost(getLifetimeCost(record.lifetimeUsage)) : "";
     const elapsedMs = (record.completedAt ?? Date.now()) - record.startedAt; // freezes once finished
-    const cost = this.showCost() ? formatCost(getLifetimeCost(record.lifetimeUsage)) : "";
-    const stats = `${formatFleetElapsed(elapsedMs)} · ${formatFleetTokens(tokens)}${cost ? ` · ${cost}` : ""}`;
-    const right = selected ? theme.fg("text", stats) : theme.fg("dim", stats);
+
+    // Model and thinking first, paired, read through buildInvocationTags so the
+    // "(asked X)" disclosure survives — the old widget's running-row head.
+    const parts: string[] = [];
+    if (this.showModel()) {
+      const { modelName, tags } = buildInvocationTags(record.invocation);
+      if (modelName) parts.push(modelName);
+      const thinkingTag = tags.find(tag => tag.startsWith("thinking: "));
+      if (thinkingTag) parts.push(thinkingTag);
+    }
+    if (activity) parts.push(formatTurns(activity.turnCount, activity.maxTurns));
+    if (record.toolUses > 0) parts.push(`${record.toolUses} tool use${record.toolUses === 1 ? "" : "s"}`);
+    if (tokenText) parts.push(tokenText);
+    if (costText) parts.push(costText);
+    parts.push(formatFleetElapsed(elapsedMs));
+    const stats = parts.join(" · ") + settledStatusText(record, theme);
+    // Nesting-safe: percent/compaction and the settled annotation carry their
+    // own colors inside the outer one, restored after every nested reset.
+    const right = fgPreservingNestedStyles(theme, selected ? "text" : "dim", stats);
     return rightAlign(left, right, width);
   }
+}
+
+/** Top-level agents only — the nested ones report through their parents. */
+function topLevelAgents(manager: AgentManager): AgentRecord[] {
+  return manager.listAgents().filter(isTopLevelAgent);
 }

@@ -1,7 +1,7 @@
 /**
  * no-fs-on-render.perf.test.ts — a frame must not touch the disk.
  *
- * The widget and the conversation viewer redraw on every TUI frame, so a
+ * The agent block and the conversation viewer redraw on every TUI frame, so a
  * synchronous read on either path blocks the event loop at up to 62 Hz. Nothing
  * on those paths reads today; this is the guard that keeps it that way, because
  * the mistake is easy to make and impossible to see in a functional test — the
@@ -33,13 +33,13 @@ vi.mock("node:fs", async (importOriginal) => {
   return { ...wrapped, default: wrapped };
 });
 
-const { AgentWidget } = await import("../../src/ui/agent-widget.js");
+const { FleetList } = await import("../../src/ui/fleet-list.js");
 const { ConversationViewer } = await import("../../src/ui/conversation-viewer.js");
-const { makeFleet, makeSession, mountViewer, mountWidget } = await import("../helpers/perf-fixtures.js");
+const { makeFleet, makeSession, mountFleet, mountViewer } = await import("../helpers/perf-fixtures.js");
 
 describe("a rendered frame touches no filesystem", () => {
-  it("AgentWidget.render", () => {
-    const w = mountWidget(AgentWidget, makeFleet({ running: 5, queued: 3, finished: 2 }));
+  it("FleetList.render (the agent block)", () => {
+    const w = mountFleet(FleetList, makeFleet({ running: 5, queued: 3, finished: 2 }));
     w.render(); // construction and priming may legitimately read; the frame may not
     FS_CALLS.length = 0;
 

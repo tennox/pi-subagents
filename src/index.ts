@@ -41,7 +41,6 @@ import { createMentionProvider, mentionRoster, type TypeInfo } from "./ui/agent-
 import {
   type AgentActivity,
   type AgentDetails,
-  AgentWidget,
   buildInvocationTags,
   describeActivity,
   fgPreservingNestedStyles,
@@ -54,7 +53,6 @@ import {
   getPromptModeLabel,
   SPINNER,
   type Theme,
-  type UICtx,
 } from "./ui/agent-widget.js";
 import { FleetList, type FleetUICtx, type FleetWorkflow } from "./ui/fleet-list.js";
 import { showSchedulesMenu } from "./ui/schedule-menu.js";
@@ -418,14 +416,14 @@ export default function (pi: ExtensionAPI) {
     // of, in one lump, on some unrelated later tool call.
     if (!b) pendingUsage.drain();
   }
-  /** Show `~$X` next to token counts in the subagent surfaces. */
+  /** Show the tracked `$…` next to token counts in the subagent surfaces. */
   let showCost = false;
   function isShowCostEnabled(): boolean { return showCost; }
-  function setShowCost(b: boolean): void { showCost = b; widget.update(); fleet.update(); }
+  function setShowCost(b: boolean): void { showCost = b; fleet.update(); }
   /** Name the model and thinking level on the widget's running rows. */
   let showModel = false;
   function isShowModelEnabled(): boolean { return showModel; }
-  function setShowModel(b: boolean): void { showModel = b; widget.update(); }
+  function setShowModel(b: boolean): void { showModel = b; fleet.update(); }
   /**
    * How much of the conversation viewer renders as Markdown. Read through a
    * getter by the viewer rather than captured like `showCost`, because the
@@ -488,22 +486,20 @@ export default function (pi: ExtensionAPI) {
 
   function sendIndividualNudge(record: AgentRecord) {
     agentActivity.delete(record.id);
-    widget.markFinished(record.id);
     fleet.onAgentFinished(record.id);
     scheduleNudge(record.id, () => emitIndividualNudge(record));
-    widget.update();
   }
 
   // ---- Group join manager ----
   const groupJoin = new GroupJoinManager(
     (records, partial) => {
-      for (const r of records) { agentActivity.delete(r.id); widget.markFinished(r.id); fleet.onAgentFinished(r.id); }
+      for (const r of records) { agentActivity.delete(r.id); fleet.onAgentFinished(r.id); }
 
       const groupKey = `group:${records.map(r => r.id).join(",")}`;
       scheduleNudge(groupKey, () => {
         // Re-check at send time
         const unconsumed = records.filter(r => !r.resultConsumed);
-        if (unconsumed.length === 0) { widget.update(); return; }
+        if (unconsumed.length === 0) { fleet.update(); return; }
 
         const notifications = unconsumed.map(r => formatTaskNotification(r, 300, showCost)).join('\n\n');
         const label = partial
@@ -523,7 +519,7 @@ export default function (pi: ExtensionAPI) {
           details,
         }, { deliverAs: "followUp", triggerTurn: true });
       });
-      widget.update();
+      fleet.update();
     },
     30_000,
   );
@@ -593,16 +589,14 @@ export default function (pi: ExtensionAPI) {
     // Skip notification if result was already consumed via get_subagent_result
     if (record.resultConsumed) {
       agentActivity.delete(record.id);
-      widget.markFinished(record.id);
       fleet.onAgentFinished(record.id);
-      widget.update();
       return;
     }
 
     // If this agent is pending batch finalization (debounce window still open),
     // don't send an individual nudge — finalizeBatch will pick it up retroactively.
     if (currentBatchAgents.some(a => a.id === record.id)) {
-      widget.update();
+      fleet.update();
       return;
     }
 
@@ -612,14 +606,12 @@ export default function (pi: ExtensionAPI) {
     }
     // 'held' → do nothing, group will fire later
     // 'delivered' → group callback already fired
-    widget.update();
+    fleet.update();
   }, undefined, (record) => {
     if (!isTopLevelAgent(record)) return;
     // Agent-tool spawns refresh these surfaces in their tool handler, but RPC
     // and scheduler spawns enter through the manager directly.
     if (currentCtx?.hasUI) {
-      widget.ensureTimer();
-      widget.update();
       fleet.ensureTimer();
       fleet.update();
     }
@@ -797,8 +789,7 @@ export default function (pi: ExtensionAPI) {
     const listScopeSessionId = ctx.sessionManager?.getSessionId?.();
     if (listScopeSessionId) setSubagentsListScope({ mainSessionId: listScopeSessionId });
     if (ctx.hasUI) {
-      widget.setUICtx(ctx.ui);
-      fleet.setUICtx(ctx.ui as any);
+      fleet.setUICtx(ctx.ui as unknown as FleetUICtx);
     }
     manager.clearCompleted(true);
     // Guard mirrors the `!scheduler.isActive()` pattern below: session_start
@@ -1131,23 +1122,24 @@ export default function (pi: ExtensionAPI) {
   });
 
   // Live widget: show running agents above editor.
-  // widgetMode (default "background") selects what the widget shows: "all" =
-  // every agent; "background" = hide foreground (they already render inline as
-  // the Agent tool result, so showing them here too is a duplicate, #118), keep
-  // everything else; "off" = hide the widget entirely. Read live at render time.
-  let widgetMode: WidgetMode = "background";
+  // widgetMode (default "all") — "off" hides the block; the retired middle
+  // value ("background", a foreground filter on the old separate widget) has no
+  // equivalent and loads as "all". Read live at render time.
+  let widgetMode: WidgetMode = "all";
   function getWidgetMode(): WidgetMode { return widgetMode; }
-  const widget = new AgentWidget(manager, agentActivity, getWidgetMode, isShowCostEnabled, isShowModelEnabled);
-  function setWidgetMode(m: WidgetMode): void { widgetMode = m; widget.update(); }
 
-  // Claude Code-style FleetView: navigable list of main + subagents below the editor.
-  // The last two arguments keep a conversation overlay opened here identical to
-  // one opened from `/agents`: same setting on the way in, same persist out.
-  const fleet = new FleetList(manager, agentActivity, isShowCostEnabled, getViewerMarkdown,
-    (mode) => chooseViewerMarkdown(mode, currentCtx as unknown as ExtensionCommandContext | undefined));
+  // Claude Code-style FleetView — the ONE agent block, above the editor. Its
+  // visibility is both settings gates in one place: `fleetView` AND
+  // `widgetMode !== "off"`. The last arguments keep a conversation overlay
+  // opened here identical to one opened from `/agents`: same setting on the way
+  // in, same persist out.
   let fleetViewEnabled = true;
   function isFleetViewEnabled(): boolean { return fleetViewEnabled; }
-  function setFleetViewEnabled(b: boolean): void { fleetViewEnabled = b; fleet.setEnabled(b); }
+  function isListVisible(): boolean { return fleetViewEnabled && widgetMode !== "off"; }
+  function setWidgetMode(m: WidgetMode): void { widgetMode = m; fleet.update(); }
+  function setFleetViewEnabled(b: boolean): void { fleetViewEnabled = b; fleet.update(); }
+  const fleet = new FleetList(manager, agentActivity, isListVisible, isShowCostEnabled, isShowModelEnabled, getViewerMarkdown,
+    (mode) => chooseViewerMarkdown(mode, currentCtx as unknown as ExtensionCommandContext | undefined));
 
   // Claude Code-style `@handle message` prompt mentions. Read live by both the
   // `input` hook and the stacked autocomplete provider, so the toggle applies
@@ -1342,12 +1334,9 @@ export default function (pi: ExtensionAPI) {
     }
 
     agentActivity.set(id, bgState);
-    // This agent already finished once, so the widget holds a finished-age
-    // for it that is past the linger limit — without clearing it, the
-    // resumed run's ✓/✗ line never renders and the agent just vanishes.
-    widget.markRunning(id);
-    widget.ensureTimer();
-    widget.update();
+    // The agent finished before, so its record carries a completedAt — the
+    // block's linger reads it, and a running record is rostered regardless, so
+    // nothing needs clearing for the resumed run to be visible.
     fleet.ensureTimer();
     fleet.update();
 
@@ -1365,11 +1354,9 @@ export default function (pi: ExtensionAPI) {
     return record;
   }
 
-  // Grab UI context from first tool execution + clear lingering widget on new turn
+  // Capture UI context for the agent block from the first tool execution.
   pi.on("tool_execution_start", async (_event, ctx) => {
-    widget.setUICtx(ctx.ui as UICtx);
     fleet.setUICtx(ctx.ui as unknown as FleetUICtx);
-    widget.onTurnStart();
   });
 
   /** Build the full type list text dynamically from available agents only. */
@@ -1776,8 +1763,8 @@ Terse command-style prompts produce shallow, generic work.
     // ---- Execute ----
 
     execute: async (toolCallId, params, signal, onUpdate, ctx) => {
-      // Ensure we have UI context for widget rendering
-      widget.setUICtx(ctx.ui as UICtx);
+      // Ensure we have UI context for agent-block rendering
+      fleet.setUICtx(ctx.ui as unknown as FleetUICtx);
 
       // Reload custom agents so new project/global .md files are picked up without restart
       reloadCustomAgents();
@@ -2106,8 +2093,6 @@ Terse command-style prompts produce shallow, generic work.
         }
 
         agentActivity.set(id, bgState);
-        widget.ensureTimer();
-        widget.update();
         fleet.ensureTimer();
         fleet.update();
 
@@ -2192,7 +2177,6 @@ Terse command-style prompts produce shallow, generic work.
           if (a.session === session) {
             fgId = a.id;
             agentActivity.set(a.id, fgState);
-            widget.ensureTimer();
             fleet.ensureTimer();
             fleet.update();
             break;
@@ -2244,11 +2228,10 @@ Terse command-style prompts produce shallow, generic work.
       } finally {
         // Runs on both paths, so a startup throw — which now propagates, see
         // the background spawn above (#179) — no longer leaves the spinner
-        // ticking or a finished agent on the widget.
+        // ticking or a finished agent on the list.
         clearInterval(spinnerInterval);
         if (fgId) {
           agentActivity.delete(fgId);
-          widget.markFinished(fgId);
           fleet.onAgentFinished(fgId);
         }
       }
@@ -2389,7 +2372,6 @@ Terse command-style prompts produce shallow, generic work.
    * triggers a turn, rendered by the existing `subagent-notification` renderer.
    */
   function notifyWorkflowFinished(task: WorkflowTask) {
-    widget.update();
     fleet.update();
     const result = workflowResultText(task);
     scheduleNudge(task.id, () => {
@@ -2563,7 +2545,6 @@ Terse command-style prompts produce shallow, generic work.
       // are owned by it, so their lifecycle callbacks no longer refresh these
       // surfaces — nothing else would register the widget for a run whose
       // first agent has not started yet.
-      widget.update();
       fleet.update();
 
       // Background, like Claude Code: the id comes back now and the run keeps
@@ -2642,7 +2623,6 @@ Terse command-style prompts produce shallow, generic work.
       }
 
       workflowsEnabled = false; // not setWorkflowsEnabled: this is not the user pinning it
-      widget.update();
       fleet.update();
       warn(verdict.message);
 
@@ -2717,7 +2697,6 @@ Terse command-style prompts produce shallow, generic work.
 
     const task = createWorkflowTask({ id: workflowRunId(), script, scriptPath: path, meta });
     workflowTasks.set(task.id, task);
-    widget.update();
     fleet.update();
     report(`Running workflow ${meta.name}…`, "info");
 
@@ -2733,7 +2712,6 @@ Terse command-style prompts produce shallow, generic work.
         content: formatWorkflowNotification(task),
         display: false,
       }, { deliverAs: "nextTurn" });
-      widget.update();
       fleet.update();
     });
   }
@@ -3817,7 +3795,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
           id: "showCost",
           label: "Show cost",
           description:
-            "Show a `$0.0042` beside subagent token counts in the widget, fleet view, results and notifications. The figure is pi's summed per-call cost for the agent's requests; a run whose calls carried no cost shows `$—` rather than $0.00.",
+            "Show a `$0.0042` beside subagent token counts in the agent block, results and notifications. The figure is pi's summed per-call cost for the agent's requests; a run whose calls carried no cost shows `$—` rather than $0.00.",
           currentValue: isShowCostEnabled() ? "on" : "off",
           values: ["on", "off"],
         },
@@ -3825,7 +3803,7 @@ Write the file using the write tool. Only write the file, nothing else.`;
           id: "showModel",
           label: "Show model",
           description:
-            "Name the model driving each agent, and the thinking level it is running at, on the widget's running rows. The Agent tool result and the conversation viewer show the pair either way — this adds it to the widget, where the row is already dense.",
+            "Name the model driving each agent, and the thinking level it is running at, on the agent block's running rows. The Agent tool result and the conversation viewer show the pair either way — this adds it to the block, where the row is already dense.",
           currentValue: isShowModelEnabled() ? "on" : "off",
           values: ["on", "off"],
         },
@@ -3839,8 +3817,8 @@ Write the file using the write tool. Only write the file, nothing else.`;
         },
         {
           id: "fleetView",
-          label: "Fleet view",
-          description: "Claude Code-style main+subagents list below the editor (↓/← to navigate, Enter to view)",
+          label: "Agent block",
+          description: "The persistent main+subagents+runs list above the editor (↓/← at an empty prompt to navigate, Enter to view — Esc back; the ↓/← keys only capture an EMPTY prompt). Off = hide the block and its key handling.",
           currentValue: isFleetViewEnabled() ? "on" : "off",
           values: ["on", "off"],
         },
@@ -3861,9 +3839,9 @@ Write the file using the write tool. Only write the file, nothing else.`;
         {
           id: "widgetMode",
           label: "Widget",
-          description: "Above-editor agent widget: all = every agent; background = hide foreground (they already render inline); off = hide the widget.",
+          description: "The agent block's own mode: all = show it (every top-level agent — foreground agents also render inline as the Agent tool result); off = hide it. The old background value is the same as all now.",
           currentValue: getWidgetMode(),
-          values: ["all", "background", "off"],
+          values: ["all", "off"],
         },
         {
           id: "toolDescriptionMode",

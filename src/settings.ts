@@ -126,9 +126,11 @@ export interface SubagentsSettings {
    */
   toolDescriptionMode?: ToolDescriptionMode;
   /**
-   * Whether the Claude Code-style FleetView (the navigable main+subagents list
-   * rendered below the editor) is shown. Defaults to `true`. Pure-UI: when off,
-   * the list never registers and the global key handler never captures input.
+   * Whether the one persistent agent block (the merged `main` + subagents +
+   * workflow-rows list rendered above the editor, `fleet-list.ts`) is shown.
+   * Defaults to `true`. Pure-UI: when off, the block never registers and the
+   * global key handler never captures input. The block's `widgetMode` setting
+   * gates it as well; hiding it there also removes the key handling.
    */
   fleetView?: boolean;
   /**
@@ -160,14 +162,15 @@ export interface SubagentsSettings {
    */
   rememberAgents?: boolean;
   /**
-   * Display mode for the persistent above-editor agent widget:
-   *   - `all`: show every agent (foreground + background).
-   *   - `background`: hide foreground agents — they already render inline as the
-   *     Agent tool result, so the widget would otherwise double-render them
-   *     (#118); everything else (background, queued, scheduled, RPC) stays.
-   *   - `off`: hide the widget entirely.
-   * Defaults to `background`. Pure-UI and applied live (toggling refreshes the
-   * widget).
+   * Display mode for the persistent agent block (the one above-editor list —
+   * the retired separate widget is merged into it):
+   *   - `all`: show the block, listing every top-level agent. Foreground agents
+   *     render here as well; they also render inline as the Agent tool result,
+   *     as before.
+   *   - `off`: hide the block entirely.
+   * Defaults to `all`. Pure-UI and applied live. A stored `background` — the
+   * retired middle value's foreground filter no longer exists — loads as
+   * `all`.
    */
   widgetMode?: WidgetMode;
   /**
@@ -348,7 +351,7 @@ export type SettingsEmit = (event: string, payload: unknown) => void;
 
 const VALID_JOIN_MODES: ReadonlySet<string> = new Set<JoinMode>(["async", "group", "smart"]);
 const VALID_TOOL_DESCRIPTION_MODES: ReadonlySet<string> = new Set<ToolDescriptionMode>(["full", "compact", "custom"]);
-const VALID_WIDGET_MODES: ReadonlySet<string> = new Set<WidgetMode>(["all", "background", "off"]);
+const VALID_WIDGET_MODES: ReadonlySet<string> = new Set<WidgetMode>(["all", "off"]);
 const VALID_VIEWER_MARKDOWN_MODES: ReadonlySet<string> = new Set<ViewerMarkdownMode>(["off", "assistant", "all"]);
 const VALID_AGENT_MENTION_MODES: ReadonlySet<string> = new Set<AgentMentionMode>(["model", "direct", "off"]);
 
@@ -444,8 +447,12 @@ function sanitize(raw: unknown): SubagentsSettings {
   if (typeof r.rememberAgents === "boolean") {
     out.rememberAgents = r.rememberAgents;
   }
-  if (typeof r.widgetMode === "string" && VALID_WIDGET_MODES.has(r.widgetMode)) {
-    out.widgetMode = r.widgetMode as WidgetMode;
+  // `background` is the retired two-widget spelling: it filtered foreground
+  // agents out of the old separate widget, a filter the merged block does not
+  // have. It loads as `all`.
+  if (typeof r.widgetMode === "string") {
+    if (r.widgetMode === "background") out.widgetMode = "all";
+    else if (VALID_WIDGET_MODES.has(r.widgetMode)) out.widgetMode = r.widgetMode as WidgetMode;
   }
   if (typeof r.outputTranscript === "boolean") {
     out.outputTranscript = r.outputTranscript;

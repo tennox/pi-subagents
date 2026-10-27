@@ -474,7 +474,7 @@ describe("mentioning an agent that has never run", () => {
         ui: {
           setStatus: vi.fn(), notify: vi.fn(), addAutocompleteProvider: vi.fn(),
           onTerminalInput: vi.fn(() => vi.fn()), getEditorText: vi.fn(() => ""), custom: vi.fn(),
-          setWidget: vi.fn((key: string, content: any) => { if (key === "agents" && content) factory = content; }),
+          setWidget: vi.fn((key: string, content: any) => { if (key === "fleet" && content) factory = content; }),
         },
       });
       await lifecycle.get("session_start")({}, uiCtx);
@@ -483,7 +483,7 @@ describe("mentioning an agent that has never run", () => {
       await flush();
 
       const theme = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
-      const lines = factory({ terminal: { columns: 200 }, requestRender: vi.fn() }, theme).render().join("\n");
+      const lines = factory({ terminal: { columns: 200 }, requestRender: vi.fn() }, theme).render(200).join("\n");
       expect(lines).toContain("≤9");
     } finally {
       setDefaultMaxTurns(prevMax);

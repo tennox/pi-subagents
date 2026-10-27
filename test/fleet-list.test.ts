@@ -87,7 +87,7 @@ interface Harness {
   overlayComponent: () => { handleInput(data: string): void } | undefined;
   /** Feed a key to the registered input handler; returns the consume result. */
   press: (data: string) => { consume?: boolean } | undefined;
-  /** Render the currently-registered below-editor widget at the given width. */
+  /** Render the currently-registered above-editor widget at the given width. */
   render: (width?: number) => string[];
   setEditorText: (t: string) => void;
   /** Whether an overlay has been opened. */
@@ -98,6 +98,10 @@ interface Harness {
   closeOverlay: () => Promise<void>;
   /** The fake `tui` handed to the widget factory; tests set `focusedComponent` on it. */
   widgetTui: { requestRender(): void; focusedComponent?: unknown };
+  /** The setStatus spy — the status bar the block owns. */
+  statusText: () => string | undefined;
+  /** The setWidget spy's calls: [key, content, options][] — registration + placement. */
+  registrations: () => unknown[][];
 }
 
 function makeWorkflow(over: Partial<FleetWorkflow> = {}): FleetWorkflow {
@@ -118,6 +122,14 @@ function harness(
   opts: {
     viewerMarkdown?: () => ViewerMarkdownMode;
     onViewerMarkdown?: (mode: ViewerMarkdownMode) => void;
+    /** The live visibility gate (the two settings in one place); default on. */
+    visible?: () => boolean;
+    /** Whether the block shows costs (the user's `showCost` setting). */
+    showCost?: () => boolean;
+    /** Whether running rows name the model (the user's `showModel` setting). */
+    showModel?: () => boolean;
+    /** Per-agent live activity, as the extension tracks it. */
+    activity?: Map<string, AgentActivity>;
   } = {},
 ): Harness {
   let inputHandler: ((data: string) => { consume?: boolean } | undefined) | undefined;
@@ -127,10 +139,13 @@ function harness(
   let closed = false;
   let overlayDone: ((r: undefined) => void) | undefined;
   let overlayComponent: { handleInput(data: string): void } | undefined;
+  const setStatus = vi.fn();
+  const setWidget = vi.fn();
   const fakeTui = { requestRender: () => {}, terminal: { columns: 120, rows: 40 } };
 
   const ui: FleetUICtx = {
-    setWidget: (_key, content) => { widgetFactory = content as any; },
+    setStatus,
+    setWidget: ((key: string, content: unknown, options?: unknown) => { setWidget(key, content, options); widgetFactory = content as any; }) as FleetUICtx["setWidget"],
     onTerminalInput: (h) => { inputHandler = h; return () => { inputHandler = undefined; }; },
     getEditorText: () => editorText,
     notify: () => {},
@@ -147,7 +162,15 @@ function harness(
   };
 
   const manager = fakeManager(agents);
-  const fleet = new FleetList(manager, new Map(), undefined, opts.viewerMarkdown, opts.onViewerMarkdown);
+  const fleet = new FleetList(
+    manager,
+    opts.activity ?? new Map(),
+    opts.visible,
+    opts.showCost,
+    opts.showModel,
+    opts.viewerMarkdown,
+    opts.onViewerMarkdown,
+  );
   fleet.setUICtx(ui);
   let workflows: FleetWorkflow[] = [];
   const openedWorkflows: string[] = [];
@@ -175,6 +198,8 @@ function harness(
     overlayClosed: () => closed,
     closeOverlay: async () => { overlayDone?.(undefined); await Promise.resolve(); },
     widgetTui: fakeTui,
+    statusText: () => setStatus.mock.calls.at(-1)?.[1] as string | undefined,
+    registrations: () => setWidget.mock.calls as unknown[][],
   };
 }
 
@@ -254,17 +279,17 @@ describe("FleetList navigation", () => {
     ]);
     h.press(DOWN); // activate → main
     h.press(DOWN); // → a1
-    const selected = h.render().find(l => l.includes("one"))!;
+    const selected = h.render(200).find(l => l.includes("one"))!;
     // Selection marker keeps accent color; row content uses primary text color.
     expect(selected).toContain("<accent>●</accent>");
     expect(selected).toContain("<text>one</text>");
-    expect(selected).toMatch(/<text>\d+s · ↓ [\d.]+k? tokens<\/text>/);
+    expect(selected).toMatch(/<text>13\.1k token · \d+s<\/text>/);
     // Agent display name rendered with the text token too (this type has no badge).
     expect(selected).toContain(`<text>${getDisplayName("general-purpose")}</text>`);
     // Inactive rows keep the muted/dim treatment.
-    const unselected = h.render().find(l => l.includes("two"))!;
+    const unselected = h.render(200).find(l => l.includes("two"))!;
     expect(unselected).toContain("<dim>○</dim>");
-    expect(unselected).toMatch(/<dim>\d+s · ↓ [\d.]+k? tokens<\/dim>/);
+    expect(unselected).toMatch(/<dim>13\.1k token · \d+s<\/dim>/);
     expect(unselected).not.toContain("<text>");
   });
 
@@ -276,7 +301,7 @@ describe("FleetList navigation", () => {
         makeRecord({ id: "a2", type: BADGED_TYPE, description: "two" }),
       ]);
       h.press(DOWN); // activate → main
-      const before = h.render().find(l => l.includes("one"))!;
+      const before = h.render(240).find(l => l.includes("one"))!;
       expect(before).toContain(`${PURPLE_BACKGROUND}`);
       expect(before).toContain(` ${BADGED_CONFIG.displayName} `);
 
@@ -330,9 +355,8 @@ describe("FleetList navigation", () => {
     expect(h.render().some(l => l.includes("← for agents"))).toBe(true);
   });
 
-  it("ignores all input while disabled and hides the widget", () => {
-    const h = harness([makeRecord()]);
-    h.fleet.setEnabled(false);
+  it("ignores all input while hidden by its settings gate and renders nothing", () => {
+    const h = harness([makeRecord()], { visible: () => false });
     expect(h.press(DOWN)).toBeUndefined();
     expect(h.render()).toEqual([]);
   });
@@ -343,14 +367,16 @@ describe("FleetList navigation", () => {
       const agents = [makeRecord({ id: "a1" })];
       const listAgents = vi.fn(() => agents);
       const manager = { listAgents, abort: () => true } as unknown as AgentManager;
-      const fleet = new FleetList(manager, new Map());
+      let visible = false;
+      const fleet = new FleetList(manager, new Map(), () => visible);
       fleet.setUICtx({
-        setWidget: () => {}, onTerminalInput: () => () => {}, getEditorText: () => "",
+        setStatus: () => {}, setWidget: () => {}, onTerminalInput: () => () => {}, getEditorText: () => "",
         notify: () => {}, custom: (() => new Promise<undefined>(() => {})) as FleetUICtx["custom"],
       });
-      fleet.update();          // shows list, arms the timer
-      fleet.setEnabled(false); // hides, clears the timer
-      fleet.setEnabled(true);  // re-shows — must re-arm the timer
+      fleet.update();           // hidden by the gate — nothing registers
+      expect(vi.getTimerCount()).toBe(0);
+      visible = true;
+      fleet.update();           // shows list — must arm the timer
       const before = listAgents.mock.calls.length;
       vi.advanceTimersByTime(250); // a tick should fire and re-read the roster
       expect(listAgents.mock.calls.length).toBeGreaterThan(before);
@@ -372,6 +398,7 @@ describe("FleetList timer leak (#leak)", () => {
     const manager = { listAgents, abort: () => true } as unknown as AgentManager;
     const fleet = new FleetList(manager, new Map());
     fleet.setUICtx({
+      setStatus: () => {},
       setWidget: () => {}, onTerminalInput: () => () => {}, getEditorText: () => "",
       notify: () => {}, custom: (() => new Promise<undefined>(() => {})) as FleetUICtx["custom"],
     });
@@ -494,17 +521,109 @@ describe("FleetList vs other focused components (#123)", () => {
 });
 
 describe("FleetList rendering", () => {
-  it("renders main + agent rows with markers, type, description and right-aligned stats", () => {
+  it("renders heading, hint, main and one agent row, with right-aligned stats", () => {
     const h = harness([makeRecord({ description: "Sleep then report 1" })]);
-    const lines = h.render(120);
-    // hint + blank + main + one agent
-    expect(lines[0]).toContain("← for agents");
+    const lines = h.render(200);
+    // heading + hint + blank + main + one agent
+    expect(lines[0]).toContain("Agents");
+    expect(lines[1]).toContain("← for agents");
     expect(lines.find(l => l.includes("main"))).toContain("●"); // main selected by default
     const agentLine = lines.find(l => l.includes("Sleep then report 1"))!;
     expect(agentLine).toContain("○");
     expect(agentLine).toContain(getDisplayName("general-purpose"));
-    expect(agentLine).toContain("↓ 13.1k tokens");
-    expect(agentLine).toMatch(/\d+s · ↓/); // "<seconds>s · ↓ ..." (timing-agnostic)
+    expect(agentLine).toContain("13.1k token");
+    expect(agentLine).toMatch(/13\.1k token · \d+s/); // tokens then elapsed, joined
+  });
+
+  it("carries every stat that fits on the idle row: turns, tool uses, tokens, cost, elapsed", () => {
+    const activity: Map<string, AgentActivity> = new Map([["a1", {
+      activeTools: new Map(), toolUses: 99, responseText: "", turnCount: 7, maxTurns: 30,
+    } as unknown as AgentActivity]]);
+    const h = harness(
+      [makeRecord({ description: "Sleep then report 1", toolUses: 12 })],
+      { activity, showCost: () => true },
+    );
+    const agentLine = h.render(200).find(l => l.includes("Sleep then report 1"))!;
+    expect(agentLine).toContain("↻7≤30");
+    expect(agentLine).toContain("12 tool uses");
+    expect(agentLine).toContain("13.1k token");
+    expect(agentLine).toContain("$—"); // no cost tracked on this record → the honest marker
+    expect(agentLine).toMatch(/\d+s/);
+  });
+
+  it("names the model and thinking level on a running row under showModel", () => {
+    const h = harness(
+      [makeRecord({ invocation: { modelName: "sonnet 4.6", modelId: "anthropic/claude-sonnet-4-6", thinking: "high" } } as Partial<AgentRecord>)],
+      { showModel: () => true },
+    );
+    const line = h.render(200).find(l => l.includes("Sleep then report 1"))!;
+    expect(line).toContain("sonnet 4.6");
+    expect(line).toContain("thinking: high");
+  });
+
+  it("renders the twin prompt-mode tag on the row", () => {
+    registerAgents(new Map([[
+      "twin-watcher",
+      { name: "twin-watcher", displayName: "Watcher", description: "Watches", extensions: false, skills: false, systemPrompt: "Watch.", promptMode: "append" },
+    ]]));
+    try {
+      const h = harness([makeRecord({ id: "t1", type: "twin-watcher", description: "the twin" })]);
+      expect(h.render(200).find(l => l.includes("the twin"))).toContain("(twin)");
+    } finally {
+      registerAgents(new Map());
+    }
+  });
+
+  it("shows every top-level agent, foreground and background alike (the retired filter is gone)", () => {
+    const h = harness([makeRecord({ id: "fg", description: "foreground run", isBackground: false })]);
+    expect(h.render(200).some(l => l.includes("foreground run"))).toBe(true);
+  });
+
+  it("animates running rows with the spinner, in both states", () => {
+    const h = harness([makeRecord({ description: "the runner" })]);
+    const idle = h.render().find(l => l.includes("the runner"))!;
+    // idle: bullet + spinner
+    expect(idle).toContain("○");
+    expect(idle).toMatch(/⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏/);
+    h.press(DOWN); // activate
+    const focused = h.render().find(l => l.includes("the runner"))!;
+    expect(focused).toContain("○");
+    expect(focused).toMatch(/⠋|⠙|⠹|⠸|⠼|⠴|⠦|⠧|⠇|⠏/);
+  });
+
+  it("renders settled rows with their status icon and annotation", () => {
+    const ok = harness([makeRecord({ description: "all good", status: "completed", completedAt: Date.now() })]);
+    expect(ok.render(200).find(l => l.includes("all good"))).toContain("✓");
+    const stopped = harness([makeRecord({ description: "halted", status: "stopped", completedAt: Date.now() })]);
+    const stoppedLine = stopped.render(200).find(l => l.includes("halted"))!;
+    expect(stoppedLine).toContain("■");
+    expect(plain(stoppedLine)).toContain("stopped");
+    const steered = harness([makeRecord({ description: "turn-limited", status: "steered", completedAt: Date.now() })]);
+    expect(plain(steered.render(200).find(l => l.includes("turn-limited"))!)).toContain("(turn limit)");
+    const failed = harness([makeRecord({ description: "broken", status: "error", completedAt: Date.now(), error: "boom" })]);
+    const failedLine = failed.render(200).find(l => l.includes("broken"))!;
+    expect(failedLine).toContain("✗");
+    expect(plain(failedLine)).toContain("error: boom");
+  });
+
+  it("summarizes queued agents with no session as one count line (the old widget's queue line)", () => {
+    const h = harness([
+      makeRecord({ id: "live", description: "running one" }),
+      makeRecord({ id: "q1", description: "waiter one", status: "queued", session: undefined }),
+      makeRecord({ id: "q2", description: "waiter two", status: "queued", session: undefined }),
+    ]);
+    const lines = h.render();
+    expect(lines.some(l => l.includes("running one"))).toBe(true);
+    expect(lines.some(l => l.includes("waiter one"))).toBe(false);
+    expect(lines.some(l => l.includes("2 queued"))).toBe(true);
+  });
+
+  it("turns the status bar into the running/queued count, independent of both settings", () => {
+    const h = harness([
+      makeRecord({ id: "a1", description: "one" }),
+      makeRecord({ id: "a2", description: "two", status: "queued", session: undefined }),
+    ]);
+    expect(h.statusText()).toBe("1 running, 1 queued agents");
   });
 
   it("orders agents earliest-launched first (top)", () => {
@@ -519,46 +638,63 @@ describe("FleetList rendering", () => {
     expect(oldIdx).toBeLessThan(newIdx); // earliest sits above the later one
   });
 
-  it("hides agents that have no session yet (pending)", () => {
+  it("keeps session-less RUNNING agents off the rows too (nothing to open)", () => {
     const agents = [
       makeRecord({ id: "live", description: "running one" }),
-      makeRecord({ id: "pending", description: "queued one", status: "queued", session: undefined }),
+      makeRecord({ id: "pending", description: "pending one", status: "running", session: undefined }),
     ];
     const lines = harness(agents).render();
     expect(lines.some(l => l.includes("running one"))).toBe(true);
-    expect(lines.some(l => l.includes("queued one"))).toBe(false);
+    expect(lines.some(l => l.includes("pending one"))).toBe(false);
   });
 
-  it("collapses overflow into a '↓ N more' indicator", () => {
+  it("collapses agent overflow into a '+N more' indicator when idle", () => {
     const agents = Array.from({ length: 8 }, (_, i) =>
       makeRecord({ id: `a${i}`, description: `report ${i}` }));
     const h = harness(agents);
-    const lines = h.render(120);
-    // 8 agents, cap 5 visible → "↓ 3 more"
-    expect(lines.some(l => l.includes("↓ 3 more"))).toBe(true);
+    const lines = h.render(240);
+    // 8 agent rows, cap 5 → 3 hidden
+    expect(lines.some(l => l.includes("+3 more"))).toBe(true);
   });
 
   it("never emits a line wider than the terminal (guards wrap-induced flicker)", () => {
     const agents = Array.from({ length: 8 }, (_, i) =>
       makeRecord({ id: `a${i}`, description: `a very long agent description number ${i} that keeps going` }));
     const h = harness(agents);
-    for (const w of [4, 8, 12, 20, 40, 80, 200]) {
-      for (const line of h.render(w)) {
-        expect(visibleWidth(line)).toBeLessThanOrEqual(w);
+    for (const focused of [false, true]) {
+      if (focused) h.press(DOWN);
+      for (const w of [4, 8, 12, 20, 40, 80, 200]) {
+        for (const line of h.render(w)) {
+          expect(visibleWidth(line)).toBeLessThanOrEqual(w);
+        }
       }
     }
   });
 
-  it("windows the visible agents so the selection stays on screen", () => {
+  it("shows every agent when focused — no windowing, no cap", () => {
     const agents = Array.from({ length: 8 }, (_, i) =>
       makeRecord({ id: `a${i}`, description: `report ${i}` }));
     const h = harness(agents);
     h.press(DOWN); // activate (main)
-    // step down to the last agent (8 agents → roster index 8)
+    // walk to the last agent — all rows are on screen, exactly where ↑↓ put them
     for (let i = 0; i < 8; i++) h.press(DOWN);
-    const lines = h.render(120);
+    const lines = h.render(240);
+    for (let i = 0; i < 8; i++) expect(lines.some(l => l.includes(`report ${i}`))).toBe(true);
     expect(lines.find(l => l.includes("report 7"))).toContain("●");
-    expect(lines.some(l => l.includes("↑"))).toBe(true); // hidden-above indicator
+    expect(lines.some(l => l.includes("more"))).toBe(false); // no windowing indicators
+  });
+
+  it("adds an activity line under running agents when focused, none when idle", () => {
+    const activity: Map<string, AgentActivity> = new Map([["a1", {
+      activeTools: new Map([["tool-1", "edit"]]), toolUses: 1, responseText: "", turnCount: 2,
+    } as unknown as AgentActivity]]);
+    const h = harness([makeRecord({ description: "editing one" })], { activity });
+    const idle = h.render();
+    expect(idle.some(l => l.includes("⎿"))).toBe(false);
+    h.press(DOWN); // activate
+    const focused = h.render();
+    expect(focused.some(l => l.includes("⎿"))).toBe(true);
+    expect(focused.some(l => plain(l).includes("editing…"))).toBe(true); // the activity under the row
   });
 });
 
@@ -635,8 +771,9 @@ describe("FleetList overlay lifecycle", () => {
     // The agent finishes, well past the linger window...
     agents[0] = makeRecord({ id: "live", description: "the one", status: "completed", completedAt: Date.now() - 60_000 });
     h.fleet.onAgentFinished("live");
-    expect(h.overlayClosed()).toBe(false);                          // viewer stays open
-    expect(h.render().some(l => l.includes("the one"))).toBe(true); // and stays listed while viewed
+    expect(h.overlayClosed()).toBe(false);                             // viewer stays open
+    expect(h.render(240).some(l => l.includes("the one"))).toBe(true); // and stays listed, icon shown
+    expect(h.render(240).find(l => l.includes("the one"))).toMatch(/✓|■|✗/);
   });
 
   it("lingers a finished agent in the list, then drops it after the window", () => {
@@ -652,9 +789,10 @@ describe("FleetList cost display", () => {
 
   function row(showCost: boolean, cost: number, activity?: Map<string, AgentActivity>): string {
     const record = makeRecord({ lifetimeUsage: { input: 13100, output: 0, cacheWrite: 0, cost } });
-    const fleet = new FleetList(fakeManager([record]), activity ?? new Map(), () => showCost);
+    const fleet = new FleetList(fakeManager([record]), activity ?? new Map(), undefined, () => showCost);
     let factory: any;
     fleet.setUICtx({
+      setStatus: () => {},
       setWidget: (_k: string, c: any) => { factory = c; },
       onTerminalInput: () => () => {},
       getEditorText: () => "",
@@ -667,7 +805,7 @@ describe("FleetList cost display", () => {
 
   it("appends the cost after the token count when enabled", () => {
     const out = row(true, 0.0042);
-    expect(out).toContain("13.1k tokens");
+    expect(out).toContain("13.1k token");
     expect(out).toContain("$0.0042");
   });
 
@@ -676,7 +814,7 @@ describe("FleetList cost display", () => {
     expect(row(true, 0)).toContain("$—");
   });
 
-  it("reads the record, so the figures do not change when the agent finishes", () => {
+  it("reads spend and tokens from the record, never from the activity tracker", () => {
     // Spend used to come from the live activity tracker while an agent ran and
     // from its record once the tracker was deleted. The two disagree: only the
     // record carries a nested child's spend (nested-tools folds it into every
@@ -684,12 +822,46 @@ describe("FleetList cost display", () => {
     // The stale shape on purpose: an activity entry carrying figures of its own
     // is what the old fallback preferred, so a row that still renders the
     // record's numbers proves the tracker is no longer consulted for spend.
+    // The tracker DOES lend the row its live turn count (↻) — everything else
+    // on the line must come from the record.
     const tracked = new Map<string, AgentActivity>([["a1", {
-      activeTools: new Map(), toolUses: 0, responseText: "", turnCount: 1,
+      activeTools: new Map(), toolUses: 42, responseText: "", turnCount: 9,
       lifetimeUsage: { input: 1, output: 1, cacheWrite: 0, cost: 0.9 },
     } as unknown as AgentActivity]]);
 
-    expect(row(true, 0.0042, tracked)).toBe(row(true, 0.0042));
+    const out = row(true, 0.0042, tracked);
+    expect(out).toContain("$0.0042");
+    expect(out).not.toContain("$0.9");
+    expect(out).toContain("13.1k token");
+    expect(out).not.toContain("0.002k token");
+    // the tracker's own live counting is still welcome
+    expect(out).toContain("↻9");
+    expect(out).not.toContain("42 tool uses"); // the record's count is what renders (0 → no part)
+  });
+
+  it("keeps the cost visible after the agent finishes (the record outlives the tracker)", () => {
+    const record = makeRecord({
+      description: "the finished one",
+      status: "completed",
+      completedAt: Date.now(),
+      toolUses: 2,
+      lifetimeUsage: { input: 13100, output: 0, cacheWrite: 0, cost: 0.0042 },
+    });
+    const fleet = new FleetList(fakeManager([record]), new Map(), undefined, () => true);
+    let factory: any;
+    fleet.setUICtx({
+      setStatus: () => {},
+      setWidget: (_k: string, c: any) => { factory = c; },
+      onTerminalInput: () => () => {},
+      getEditorText: () => "",
+      notify: () => {},
+      custom: (() => new Promise(() => {})) as never,
+    } as never);
+    fleet.update();
+    const out = factory({ requestRender: () => {}, terminal: { columns: 240, rows: 40 } }, theme).render(240).join("\n");
+    expect(out).toContain("the finished one");
+    expect(out).toContain("$0.0042");
+    expect(out).toContain("✓");
   });
 });
 
@@ -887,5 +1059,120 @@ describe("FleetList workflow rows", () => {
     h.setWorkflows([makeWorkflow({ status: "completed", startedAt: completedAt - 12_000, completedAt })]);
 
     expect(h.render().map(plain).join("\n")).toContain("12s");
+  });
+});
+
+/* ------------------------------------------------------------------------- *
+ * The merged block (the retired separate AgentWidget's behaviors)
+ * ------------------------------------------------------------------------- */
+
+describe("The agent block", () => {
+  /** Registration options the harness's setWidget calls carried (function-content only). */
+  function registrations(h: Harness) {
+    return h.registrations().filter(c => typeof c[1] === "function") as [string, unknown, { placement: string }][];
+  }
+
+  it("registers ONE above-editor widget under its own key", () => {
+    const h = harness([makeRecord({ id: "a1", description: "one" })]);
+    const regs = registrations(h);
+    expect(regs.length).toBe(1);
+    expect(regs[0][0]).toBe("fleet");
+    expect(regs[0][2]?.placement).toBe("aboveEditor");
+  });
+
+  it("shows the Agents heading accent while agents run, dim otherwise", () => {
+    const running = harness([makeRecord({ id: "a1", description: "one" })]);
+    expect(running.render()[0]).toMatch(/<accent>●<\/accent> <accent>Agents<\/accent>/);
+
+    const settled = harness([makeRecord({ id: "a1", description: "one", status: "completed", completedAt: Date.now() })]);
+    expect(settled.render()[0]).toMatch(/<dim>○<\/dim> <dim>Agents<\/dim>/);
+
+    const pausedRun = harness([]);
+    pausedRun.setWorkflows([makeWorkflow({ status: "paused" })]);
+    expect(pausedRun.render()[0]).toMatch(/<dim>○<\/dim> <dim>Agents<\/dim>/);
+  });
+
+  it("keeps the heading when only session-less queued agents exist", () => {
+    const h = harness([makeRecord({ id: "q1", description: "waiter", status: "queued", session: undefined })]);
+    const lines = h.render();
+    expect(lines[0]).toContain("Agents");
+    expect(lines.some(l => l.includes("1 queued"))).toBe(true);
+  });
+
+  // Swept rather than sampled, as the retired widget's cap suite was: the
+  // unfocused-collapse arithmetic (head-window + one footer line) has an
+  // off-by-one for specific shapes, and a capped render is the only state where
+  // the block drops rows silently.
+  describe("idle overflow accounting", () => {
+    function record(id: string, status: string): AgentRecord {
+      return makeRecord({
+        id,
+        description: `${id} description`,
+        status,
+        completedAt: status === "completed" ? Date.now() - 100 : undefined,
+        session: status === "queued" ? undefined : (FAKE_SESSION as any),
+      } as Partial<AgentRecord>);
+    }
+
+    /** The `+N more` footer, if the block overflowed. */
+    const footer = (lines: string[]) => lines.find(l => l.includes("+") && l.includes("more"));
+
+    const SHAPES: { running: number; queued: number; finished: number }[] = [];
+    for (let running = 0; running <= 8; running++)
+      for (let queued = 0; queued <= 8; queued++)
+        for (let finished = 0; finished <= 8; finished++) SHAPES.push({ running, queued, finished });
+
+    // The full 9³ shape sweep takes ~7s — a timeout, not a hang.
+    it("shows at most MAX_AGENT_ROWS rows and footer-counts the rest, for any fleet shape", { timeout: 30_000 }, () => {
+      for (const counts of SHAPES) {
+        const agents = [
+          ...Array.from({ length: counts.running }, (_, i) => record(`run${i}`, "running")),
+          ...Array.from({ length: counts.queued }, (_, i) => record(`q${i}`, "queued")),
+          ...Array.from({ length: counts.finished }, (_, i) => record(`fin${i}`, "completed")),
+        ];
+        const lines = harness(agents).render();
+        // Session-less queued agents render only in the ◦ N queued summary.
+        const rows = lines.filter(l => l.includes("description"));
+        expect(rows.length, JSON.stringify(counts)).toBeLessThanOrEqual(5);
+        expect(rows.length, JSON.stringify(counts)).toBe(Math.min(counts.running + counts.finished, 5));
+        const f = footer(lines);
+        if (f) {
+          const hidden = Number(/\+(\d+) more/.exec(f)?.[1]);
+          expect(hidden, JSON.stringify(counts)).toBe(counts.running + counts.finished - rows.length);
+        } else {
+          expect(counts.running + counts.finished, JSON.stringify(counts)).toBeLessThanOrEqual(5);
+        }
+      }
+    });
+
+    it("never shows a +0 more footer", { timeout: 30_000 }, () => {
+      for (const counts of SHAPES) {
+        const agents = [
+          ...Array.from({ length: counts.running }, (_, i) => record(`run${i}`, "running")),
+          ...Array.from({ length: counts.queued }, (_, i) => record(`q${i}`, "queued")),
+          ...Array.from({ length: counts.finished }, (_, i) => record(`fin${i}`, "completed")),
+        ];
+        const f = footer(harness(agents).render());
+        if (f) expect(Number(/\+(\d+) more/.exec(f)?.[1]), JSON.stringify(f)).toBeGreaterThan(0);
+      }
+    });
+
+    it("keeps the queued summary visible when running agents fill the cap", () => {
+      const agents = [
+        ...Array.from({ length: 5 }, (_, i) => record(`run${i}`, "running")),
+        ...Array.from({ length: 3 }, (_, i) => record(`q${i}`, "queued")),
+      ];
+      expect(harness(agents).render().join("\n")).toContain("3 queued");
+    });
+
+    it("shows everything and no footer when the fleet fits", () => {
+      const agents = [
+        ...Array.from({ length: 2 }, (_, i) => record(`run${i}`, "running")),
+        record("fin0", "completed"),
+      ];
+      const lines = harness(agents).render();
+      expect(lines.join("\n")).toContain("fin0 description");
+      expect(footer(lines)).toBeUndefined();
+    });
   });
 });

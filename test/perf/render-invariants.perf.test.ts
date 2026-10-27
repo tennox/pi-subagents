@@ -43,7 +43,7 @@ vi.mock("@earendil-works/pi-tui", async (importOriginal) => {
 });
 
 // After the mock, so the subjects bind the counting versions.
-const { AgentWidget } = await import("../../src/ui/agent-widget.js");
+const { FleetList } = await import("../../src/ui/fleet-list.js");
 const { ConversationViewer } = await import("../../src/ui/conversation-viewer.js");
 const { makeActivity, makeFleet, makeSession, mountViewer, perfTheme, perfTui } = await import(
   "../helpers/perf-fixtures.js"
@@ -103,7 +103,7 @@ describe("ConversationViewer — cost stays linear in transcript length", () => 
   });
 });
 
-describe("AgentWidget — one frame does not rescan per agent", () => {
+describe("The agent block — one frame does not rescan per agent", () => {
   /** Renders one frame over `n` agents; returns how often the manager was asked. */
   function listCallsPerRender(n: number): number {
     const records = makeFleet({ running: n });
@@ -115,25 +115,33 @@ describe("AgentWidget — one frame does not rescan per agent", () => {
       },
     } as any;
 
-    const widget = new AgentWidget(manager, makeActivity(records), () => "all", () => false, () => false);
+    const fleet = new FleetList(manager, makeActivity(records), () => true);
     let factory: any;
-    widget.setUICtx({ setStatus: () => {}, setWidget: (_k: string, c: any) => { factory = c; } } as any);
-    widget.update();
+    fleet.setUICtx({
+      setStatus: () => {},
+      onTerminalInput: () => () => {},
+      getEditorText: () => "",
+      notify: () => {},
+      custom: () => new Promise(() => {}),
+      setWidget: (_k: string, c: any) => { factory = c; },
+    } as any);
+    fleet.update();
     const tui = perfTui();
-    factory?.(tui, perfTheme).render(); // prime
+    factory?.(tui, perfTheme).render(120); // prime
     listAgentsCalls = 0;
-    factory?.(tui, perfTheme).render();
-    widget.dispose?.();
+    factory?.(tui, perfTheme).render(120);
+    fleet.dispose?.();
     return listAgentsCalls;
   }
 
-  // Today a render is exactly one scan (`update()` does the other). The bound is
-  // "a constant, and the same constant at 100 agents as at 1" — a per-agent
-  // lookup added to the row builder would break it, and collapsing the two
-  // remaining scans into one would not.
+  // A render scans the roster a fixed number of times (rows + the queued
+  // summary), each an O(agents) pass — fine, as long as it is CONSTANT per
+  // frame and the same constant at 100 agents as at 1. A per-agent lookup
+  // added to the row builder would break that, and a render that grew a
+  // second pass per agent would too.
   it("asks the manager for the agent list a constant number of times", () => {
-    expect(listCallsPerRender(1)).toBeLessThanOrEqual(2);
-    expect(listCallsPerRender(100)).toBeLessThanOrEqual(2);
+    expect(listCallsPerRender(1)).toBeLessThanOrEqual(3);
+    expect(listCallsPerRender(100)).toBeLessThanOrEqual(3);
     expect(listCallsPerRender(100)).toBe(listCallsPerRender(1));
   });
 });
